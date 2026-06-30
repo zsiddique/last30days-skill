@@ -7,7 +7,7 @@ import urllib.parse
 from datetime import datetime
 from urllib.parse import urlparse
 
-from . import dates, env, http, web_search_keyless
+from . import dates, env, http, web_crawl4ai, web_search_keyless
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +207,11 @@ def web_search(
             backend = "serper"
         elif config.get("PARALLEL_API_KEY"):
             backend = "parallel"
+        elif config.get("CRAWL4AI_URL") and env.keyless_web_allowed(config):
+            # On-infra preference: a configured crawl4ai service beats the
+            # keyless floor (renders JS, hides datacenter egress) while still
+            # only running when there's no paid key and no native host search.
+            backend = "crawl4ai"
         elif env.keyless_web_allowed(config):
             # No paid key and the host has no native search -> use the keyless
             # floor. On a native-search host this branch is skipped (the model
@@ -236,6 +241,8 @@ def web_search(
         if not key:
             raise RuntimeError("PARALLEL_API_KEY is required when web_backend='parallel'")
         items, artifact = parallel_search(query, date_range, key)
+    elif backend == "crawl4ai":
+        items, artifact = web_crawl4ai.crawl4ai_search(query, date_range, config)
     elif backend == "keyless":
         items, artifact = web_search_keyless.keyless_search(query, date_range, config)
     elif backend != "none":

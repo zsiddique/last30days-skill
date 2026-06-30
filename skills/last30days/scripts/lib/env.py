@@ -414,6 +414,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_X_BACKEND', None),
         ('LAST30DAYS_REDDIT_BACKEND', None),
         ('LAST30DAYS_REDDIT_SC_MIN_ITEMS', None),
+        ('CRAWL4AI_URL', None),
         ('LAST30DAYS_STORE', None),
         ('LAST30DAYS_MEMORY_DIR', None),
         ('OPENAI_MODEL_PIN', None),

@@ -35,6 +35,7 @@ from . import (
     providers,
     query,
     reddit,
+    reddit_crawl4ai,
     reddit_public,
     relevance,
     rerank,
@@ -1237,6 +1238,31 @@ def _retrieve_stream(
             and (config.get("LAST30DAYS_REDDIT_BACKEND") or "").lower()
             == "scrapecreators"
         )
+        crawl4ai_first = (
+            (config.get("LAST30DAYS_REDDIT_BACKEND") or "").lower() == "crawl4ai"
+        )
+        if crawl4ai_first:
+            # LAST30DAYS_REDDIT_BACKEND=crawl4ai: crawl4ai primary (datacenter /
+            # headless-fleet path), then fall through to the public/SC chain.
+            try:
+                c4_results = reddit_crawl4ai.search_reddit_crawl4ai(
+                    reddit_query, from_date, to_date, depth=depth,
+                    subreddits=subreddits,
+                    dedicated_subreddits=dedicated_subreddits,
+                    config=config,
+                )
+                if c4_results:
+                    return c4_results, {}
+                sys.stderr.write(
+                    "[Reddit] crawl4ai primary returned no items, "
+                    "using public/SC fallback\n"
+                )
+            except Exception as exc:
+                sys.stderr.write(
+                    f"[Reddit] crawl4ai primary failed "
+                    f"({type(exc).__name__}: {exc}), using public/SC fallback\n"
+                )
+
         if sc_first:
             # LAST30DAYS_REDDIT_BACKEND=scrapecreators: SC primary, public fallback
             try:

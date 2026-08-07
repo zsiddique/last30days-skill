@@ -31,9 +31,14 @@ def test_configuration_documents_new_safety_flags():
     assert "--output" in text
     assert "--publish-html" in flags
     assert "--publish-html" in text
+    assert "--publish" in flags
+    assert "library feed --publish" in text
     assert "--publish-password" in flags
     assert "--publish-password" in text
     assert "LAST30DAYS_PUBLISH_PASSWORD" in text
+    assert "--record-fixtures" in flags
+    assert "--record-fixtures" in text
+    assert "docs/reference/eval.md" in text
 
 
 def test_html_publish_reference_prompts_for_password_choice():

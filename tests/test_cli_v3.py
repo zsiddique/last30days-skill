@@ -1,3 +1,4 @@
+import contextlib
 import json
 import io
 import shutil
@@ -7,6 +8,7 @@ import sys
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -60,9 +62,11 @@ class CliV3Tests(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertIn("query_plan", payload)
-        self.assertIn("ranked_candidates", payload)
+        self.assertEqual("1.2", payload["schema_version"])
+        self.assertEqual("test topic", payload["query"])
+        self.assertIn("results", payload)
         self.assertIn("clusters", payload)
+        self.assertIn("source_status", payload)
 
     def test_invalid_plan_json_exits_nonzero(self):
         """Malformed --plan JSON must fail fast, not silently fall back to the
@@ -269,7 +273,7 @@ class CliV3Tests(unittest.TestCase):
         brief = cli.emit_output(report, "brief")
 
         self.assertIn("# last30days v", compact)
-        self.assertIn('"topic": "OpenClaw vs NanoClaw"', json_output)
+        self.assertIn('"query": "OpenClaw vs NanoClaw"', json_output)
         self.assertIsInstance(context, str)
         self.assertIn("# Production Brief:", brief)
 
@@ -282,15 +286,34 @@ class CliV3Tests(unittest.TestCase):
             path = cli.save_output(report, "json", tmp)
             self.assertEqual(".json", path.suffix)
             payload = json.loads(path.read_text())
-            self.assertEqual("OpenClaw vs NanoClaw", payload["topic"])
+            self.assertEqual("OpenClaw vs NanoClaw", payload["query"])
+
+    def test_save_output_uses_unique_dated_fallback(self):
+        report = self.make_report()
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = Path(tmp)
+            today = datetime.now().strftime("%Y-%m-%d")
+            base = save_dir / "openclaw-vs-nanoclaw-raw.md"
+            dated = save_dir / f"openclaw-vs-nanoclaw-raw-{today}.md"
+            base.write_text("base content", encoding="utf-8")
+            dated.write_text("dated content", encoding="utf-8")
+
+            saved = cli.save_output(report, "md", tmp)
+
+            self.assertEqual((save_dir / f"openclaw-vs-nanoclaw-raw-{today}-1.md").resolve(), saved)
+            self.assertEqual("base content", base.read_text(encoding="utf-8"))
+            self.assertEqual("dated content", dated.read_text(encoding="utf-8"))
+            self.assertTrue(saved.exists())
 
     def test_save_output_writes_utf8_encoded_markdown(self):
         report = self.make_report()
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch("pathlib.Path.write_text", autospec=True, return_value=1) as write_text:
-                cli.save_output(report, "md", tmp)
-        _, kwargs = write_text.call_args
-        self.assertEqual("utf-8", kwargs.get("encoding"))
+            path = cli.save_output(report, "md", tmp)
+            raw = path.read_bytes()
+            content = path.read_text(encoding="utf-8")
+        self.assertIn(report.topic, content)
+        # Verify the raw bytes decode cleanly as UTF-8.
+        self.assertEqual(content, raw.decode("utf-8"))
 
     def test_save_rendered_output_writes_exact_file_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -339,6 +362,7 @@ class CliV3Tests(unittest.TestCase):
         report = self.make_report()
 
         success_store = types.SimpleNamespace(
+            scoped_db=lambda _path: contextlib.nullcontext(),
             init_db=mock.Mock(),
             add_topic=mock.Mock(return_value={"id": 7}),
             record_run=mock.Mock(return_value=11),
@@ -357,6 +381,7 @@ class CliV3Tests(unittest.TestCase):
         )
 
         failure_store = types.SimpleNamespace(
+            scoped_db=lambda _path: contextlib.nullcontext(),
             init_db=mock.Mock(),
             add_topic=mock.Mock(return_value={"id": 7}),
             record_run=mock.Mock(return_value=12),
@@ -551,6 +576,47 @@ class CliV3Tests(unittest.TestCase):
             f"saw {[c.kwargs.get('github_repos') for c in run_mock.call_args_list]}",
         )
         self.assertIn("[GitHub] Canonicalized repos:", stderr.getvalue())
+
+    def test_main_passes_trustpilot_domain_to_pipeline_run(self):
+        """The user-set flag must reach pipeline.run verbatim with
+        provenance user-set (is_hint False) on the single-topic path."""
+        report = self.make_report()
+        diag = {
+            "available_sources": ["grounding"],
+            "providers": {"google": True, "openai": False, "xai": False},
+            "x_backend": None,
+            "bird_installed": True,
+            "bird_authenticated": False,
+            "bird_username": None,
+            "native_web_backend": "brave",
+        }
+        with mock.patch.object(cli.env, "get_config", return_value={}), \
+             mock.patch.object(cli.pipeline, "diagnose", return_value=diag), \
+             mock.patch.object(cli.pipeline, "run", return_value=report) as run_mock, \
+             mock.patch.object(cli, "emit_output", return_value="# rendered"), \
+             mock.patch.object(sys, "argv", [
+                 "last30days.py",
+                 "ThriftBooks",
+                 "--trustpilot-domain",
+                 "www.thriftbooks.com",
+             ]):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = cli.main()
+        self.assertEqual(0, rc)
+        main_call = next(
+            (c for c in run_mock.call_args_list
+             if c.kwargs.get("trustpilot_domain") == "www.thriftbooks.com"),
+            None,
+        )
+        self.assertIsNotNone(
+            main_call,
+            f"No pipeline.run call carried trustpilot_domain; saw "
+            f"{[c.kwargs.get('trustpilot_domain') for c in run_mock.call_args_list]}",
+        )
+        self.assertFalse(main_call.kwargs.get("trustpilot_domain_is_hint"))
+
 
 if __name__ == "__main__":
     unittest.main()

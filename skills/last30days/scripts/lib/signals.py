@@ -13,6 +13,9 @@ SOURCE_QUALITY = {
     "hackernews": 0.8,
     "youtube": 0.85,
     "digg": 0.85,
+    "arxiv": 0.9,
+    "techmeme": 0.85,
+    "trustpilot": 0.78,
     "reddit": 0.6,
     "x": 0.68,
     "bluesky": 0.66,
@@ -21,6 +24,7 @@ SOURCE_QUALITY = {
     "instagram": 0.58,
     "tiktok": 0.58,
     "jobs": 0.72,
+    "corpus": 0.75,
 }
 
 
@@ -162,6 +166,7 @@ ENGAGEMENT_WEIGHTS: dict[str, list[tuple[str, float]]] = {
     "truthsocial":  [("likes", 0.45), ("reposts", 0.30), ("replies", 0.25)],
     "polymarket":   [("volume", 0.60), ("liquidity", 0.40)],
     "digg":         [("postCount", 0.40), ("uniqueAuthors", 0.30), ("rank_score", 0.30)],
+    "trustpilot":   [("reviews", 1.0)],
 }
 
 
@@ -205,6 +210,19 @@ def _tiktok_engagement(item: schema.SourceItem) -> float | None:
     return (0.45 * views) + (0.27 * likes) + (0.18 * comments) + (0.10 * top_comment)
 
 
+def _instagram_engagement(item: schema.SourceItem) -> float | None:
+    # Mirrors _tiktok_engagement: reels are video-shaped, and a highly-liked top
+    # comment carves out 10% of the signal (via comment_like_count -> score) so
+    # crowd-loved IG comments lift their post's ranking like YouTube/TikTok.
+    views = log1p_safe(item.engagement.get("views"))
+    likes = log1p_safe(item.engagement.get("likes"))
+    comments = log1p_safe(item.engagement.get("comments"))
+    top_comment = _top_comment_score(item)
+    if not any([views, likes, comments, top_comment]):
+        return None
+    return (0.45 * views) + (0.27 * likes) + (0.18 * comments) + (0.10 * top_comment)
+
+
 def _generic_engagement(item: schema.SourceItem) -> float | None:
     if not item.engagement:
         return None
@@ -221,6 +239,8 @@ def engagement_raw(item: schema.SourceItem) -> float | None:
         return _youtube_engagement(item)
     if item.source == "tiktok":
         return _tiktok_engagement(item)
+    if item.source == "instagram":
+        return _instagram_engagement(item)
     weights = ENGAGEMENT_WEIGHTS.get(item.source)
     if weights:
         return _weighted_engagement(item, weights)

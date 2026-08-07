@@ -2,9 +2,40 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from lib import pipeline
+from lib import health
 from lib import http
+from lib import pipeline
 from lib import schema
+
+
+class DepthSettingsOverrideTests(unittest.TestCase):
+    def test_no_overrides_returns_depth_defaults(self):
+        settings = pipeline._resolve_depth_settings("deep", {})
+        self.assertEqual(pipeline.DEPTH_SETTINGS["deep"], settings)
+
+    def test_overrides_raise_caps_and_do_not_mutate_module_defaults(self):
+        before = dict(pipeline.DEPTH_SETTINGS["deep"])
+        settings = pipeline._resolve_depth_settings(
+            "deep", {"_max_per_source": 60, "_max_results": 200}
+        )
+        self.assertEqual(60, settings["per_stream_limit"])
+        self.assertEqual(200, settings["pool_limit"])
+        self.assertEqual(200, settings["rerank_limit"])
+        # Module-level defaults must be untouched (issue #716 regression guard).
+        self.assertEqual(before, pipeline.DEPTH_SETTINGS["deep"])
+
+    def test_overrides_can_also_lower_caps(self):
+        settings = pipeline._resolve_depth_settings("deep", {"_max_results": 10})
+        self.assertEqual(10, settings["rerank_limit"])
+
+    def test_zero_override_is_honored_not_swallowed(self):
+        # 0 is a valid explicit value (e.g. disable a source), not "unset".
+        settings = pipeline._resolve_depth_settings(
+            "deep", {"_max_results": 0, "_max_per_source": 0}
+        )
+        self.assertEqual(0, settings["pool_limit"])
+        self.assertEqual(0, settings["rerank_limit"])
+        self.assertEqual(0, settings["per_stream_limit"])
 
 
 class PipelineV3Tests(unittest.TestCase):
@@ -23,6 +54,16 @@ class PipelineV3Tests(unittest.TestCase):
         # Grounding items now enter the ranked pool (web search backends produce real items)
         self.assertIn("grounding", report.items_by_source)
         self.assertEqual("gemini", report.provider_runtime.reasoning_provider)
+
+    def test_empty_explicit_plan_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "intent"):
+            pipeline.run(
+                topic="test topic",
+                config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+                depth="quick",
+                external_plan={},
+                mock=True,
+            )
 
     def test_planner_trace_always_fires_on_mock_run(self):
         """Unit 5: The unified planner trace emits one summary line plus one
@@ -101,6 +142,30 @@ class PipelineV3Tests(unittest.TestCase):
         )
         self.assertEqual(["jobs"], sorted(report.items_by_source))
         self.assertTrue(report.artifacts["hiring_signals"]["include"])
+
+    def test_explicit_sources_suppress_automatic_company_jobs(self):
+        report = pipeline.run(
+            topic="Listen Labs",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="quick",
+            requested_sources=["grounding", "x"],
+            mock=True,
+        )
+        self.assertEqual({"grounding", "x"}, set(report.items_by_source))
+        self.assertTrue(
+            all("jobs" not in subquery.sources for subquery in report.query_plan.subqueries)
+        )
+
+    def test_hiring_signals_forces_jobs_with_explicit_non_jobs_sources(self):
+        report = pipeline.run(
+            topic="Listen Labs",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="quick",
+            requested_sources=["grounding", "x"],
+            mock=True,
+            hiring_signals_mode=True,
+        )
+        self.assertEqual({"grounding", "jobs", "x"}, set(report.items_by_source))
 
     def test_standard_company_run_fetches_jobs_for_signal_gate(self):
         report = pipeline.run(
@@ -243,6 +308,33 @@ class TestSourceFetchCap(unittest.TestCase):
             f"X should be fetched at most 2 times, got {len(x_calls)}",
         )
 
+    @patch("lib.pipeline._retrieve_stream")
+    def test_zero_source_fetch_override_suppresses_capped_source(self, mock_retrieve):
+        """A 0 override is explicit and should suppress capped-source submissions."""
+        mock_retrieve.side_effect = lambda **kwargs: pipeline._mock_stream_results(
+            kwargs["source"], kwargs["subquery"]
+        )
+        pipeline.run(
+            topic="compare iPhone vs Android vs Pixel vs Samsung",
+            config={
+                "LAST30DAYS_REASONING_PROVIDER": "gemini",
+                "_max_source_fetches": 0,
+            },
+            depth="quick",
+            requested_sources=["reddit", "x"],
+            mock=True,
+        )
+        x_calls = [
+            call for call in mock_retrieve.call_args_list
+            if call.kwargs.get("source") == "x"
+        ]
+        reddit_calls = [
+            call for call in mock_retrieve.call_args_list
+            if call.kwargs.get("source") == "reddit"
+        ]
+        self.assertEqual([], x_calls)
+        self.assertGreater(len(reddit_calls), 0)
+
 
 class TestRateLimitSharing(unittest.TestCase):
     """429 signals should be shared across subqueries."""
@@ -355,6 +447,91 @@ class TestThinSourceRetryPlannedSource(unittest.TestCase):
         self.assertEqual(["x"], [call.kwargs["source"] for call in mock_retrieve.call_args_list])
         self.assertIn("x", bundle.items_by_source)
         self.assertEqual("https://x.com/example/status/100", bundle.items_by_source["x"][0].url)
+
+
+class TestPinnedGithubPersonAuthority(unittest.TestCase):
+    @patch("lib.pipeline._retrieve_stream")
+    @patch("lib.pipeline.github.search_github_person", return_value=[])
+    def test_empty_person_result_suppresses_generic_fanout_and_retry(
+        self, mock_person_search, mock_retrieve
+    ):
+        plan = {
+            "intent": "person",
+            "freshness_mode": "balanced_recent",
+            "cluster_mode": "topic",
+            "subqueries": [
+                {
+                    "label": "primary",
+                    "search_query": "octocat recent activity",
+                    "ranking_query": "What has @octocat done on GitHub recently?",
+                    "sources": ["github"],
+                }
+            ],
+            "source_weights": {"github": 1.0},
+        }
+
+        report = pipeline.run(
+            topic="octocat",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="default",
+            requested_sources=["github"],
+            mock=True,
+            external_plan=plan,
+            github_user="octocat",
+        )
+
+        mock_person_search.assert_called_once()
+        mock_retrieve.assert_not_called()
+        self.assertEqual(schema.NO_RESULTS, report.source_status["github"].state)
+        self.assertIn(
+            "Person mode found no activity for @octocat",
+            report.source_status["github"].detail,
+        )
+
+    @patch("lib.pipeline._retrieve_stream")
+    @patch(
+        "lib.pipeline.github.search_github_person",
+        side_effect=RuntimeError("GitHub API unavailable"),
+    )
+    def test_person_failure_suppresses_generic_fanout_and_retry(
+        self, mock_person_search, mock_retrieve
+    ):
+        plan = {
+            "intent": "person",
+            "freshness_mode": "balanced_recent",
+            "cluster_mode": "topic",
+            "subqueries": [
+                {
+                    "label": "primary",
+                    "search_query": "octocat recent activity",
+                    "ranking_query": "What has @octocat done on GitHub recently?",
+                    "sources": ["github"],
+                }
+            ],
+            "source_weights": {"github": 1.0},
+        }
+
+        report = pipeline.run(
+            topic="octocat",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="default",
+            requested_sources=["github"],
+            mock=True,
+            external_plan=plan,
+            github_user="octocat",
+        )
+
+        mock_person_search.assert_called_once()
+        mock_retrieve.assert_not_called()
+        self.assertEqual(health.ERROR, report.source_status["github"].state)
+        self.assertEqual(
+            "GitHub API unavailable",
+            report.source_status["github"].detail,
+        )
+        self.assertEqual(
+            "Person-mode failed: GitHub API unavailable",
+            report.errors_by_source["github"],
+        )
 
 
 

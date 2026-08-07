@@ -339,7 +339,7 @@ def _fetch_item_comments(object_id: str, max_comments: int = 5) -> Dict[str, Any
         comments.append({
             "author": c.get("author", ""),
             "text": excerpt,
-            "points": c.get("points") or 0,
+            "points": c.get("points"),
         })
         # First sentence as insight
         first_sentence = text.split(". ")[0].split("\n")[0][:200]
@@ -370,7 +370,7 @@ def enrich_top_stories(
     # Sort by points to enrich the most popular stories
     by_points = sorted(
         range(len(items)),
-        key=lambda i: items[i].get("engagement", {}).get("points", 0),
+        key=lambda i: items[i].get("engagement", {}).get("points") or 0,
         reverse=True,
     )
     to_enrich = by_points[:limit]

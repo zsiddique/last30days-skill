@@ -1,6 +1,7 @@
+import copy
 import unittest
 
-from lib import render, schema
+from lib import hiring_signals, render, schema
 
 
 def sample_report() -> schema.Report:
@@ -84,6 +85,25 @@ def sample_report() -> schema.Report:
     )
 
 
+def mixed_representative_report() -> schema.Report:
+    report = sample_report()
+    missed_representative = report.ranked_candidates[0]
+    missed_representative.final_score = 14
+    missed_representative.explanation = (
+        "fallback-local-score (entity-miss demotion)"
+    )
+    qualifying_member = copy.deepcopy(missed_representative)
+    qualifying_member.candidate_id = "c2"
+    qualifying_member.title = "Solid nonrepresentative evidence"
+    qualifying_member.snippet = "Solid nonrepresentative evidence snippet."
+    qualifying_member.final_score = 72
+    qualifying_member.explanation = "high-signal result"
+    report.ranked_candidates.append(qualifying_member)
+    report.clusters[0].candidate_ids.append("c2")
+    report.clusters[0].score = 72
+    return report
+
+
 class RenderV3Tests(unittest.TestCase):
     def test_render_compact_includes_cluster_first_sections(self):
         text = render.render_compact(sample_report())
@@ -114,6 +134,205 @@ class RenderV3Tests(unittest.TestCase):
         report.errors_by_source = {"x": "HTTP 400: Bad Request"}
         text = render.render_compact(report)
         self.assertIn("## Source Errors", text)
+
+    def test_failed_x_bookmark_workflow_query_emits_no_solid_floor(self):
+        """Regression: generic token overlap must not turn all-zero X noise
+        into findings or quotable comments for a compound workflow query."""
+        report = sample_report()
+        report.topic = (
+            "AI-assisted X bookmark triage, knowledge capture, "
+            "and safe engagement automation"
+        )
+        report.query_plan.raw_topic = report.topic
+        report.clusters[0].score = 0
+        report.ranked_candidates[0].final_score = 0
+        report.ranked_candidates[0].explanation = (
+            "fallback-local-score (entity-miss demotion)"
+        )
+        report.ranked_candidates[0].source_items[0].metadata["top_comments"] = [
+            {
+                "excerpt": "An unrelated but highly voted comment one.",
+                "score": 500,
+            },
+            {
+                "excerpt": "An unrelated but highly voted comment two.",
+                "score": 400,
+            },
+        ]
+
+        text = render.render_compact(report)
+
+        self.assertIn("**Nothing solid this window.**", text)
+        self.assertNotIn("### 1. Grounded result", text)
+        self.assertNotIn("## Top Community Comments", text)
+        self.assertIn("## Stats", text)
+        self.assertIn("All agents reported back!", text)
+
+    def test_positive_cluster_with_only_entity_miss_representatives_is_rejected(self):
+        report = sample_report()
+        report.clusters[0].score = 30
+        report.ranked_candidates[0].final_score = 30
+        report.ranked_candidates[0].explanation = (
+            "fallback-local-score (entity-miss demotion)"
+        )
+
+        text = render.render_compact(report)
+
+        self.assertIn("**Nothing solid this window.**", text)
+        self.assertNotIn("### 1. Grounded result", text)
+
+    def test_qualifying_nonrepresentative_preserves_cluster_and_becomes_visible(self):
+        text = render.render_compact(mixed_representative_report())
+
+        self.assertNotIn("**Nothing solid this window.**", text)
+        self.assertIn("### 1. Grounded result", text)
+        self.assertIn("Solid nonrepresentative evidence", text)
+
+    def test_compact_and_comparison_preserve_all_qualifying_representatives(self):
+        report = sample_report()
+        second_representative = copy.deepcopy(report.ranked_candidates[0])
+        second_representative.candidate_id = "c2"
+        second_representative.title = "Second qualifying representative"
+        second_representative.snippet = "Independent supporting evidence."
+        report.ranked_candidates.append(second_representative)
+        report.clusters[0].candidate_ids.append("c2")
+        report.clusters[0].representative_ids.append("c2")
+
+        renderers = {
+            "compact": render.render_compact,
+            "comparison": lambda value: render.render_comparison_multi(
+                [("Example", value)]
+            ),
+        }
+        for name, renderer in renderers.items():
+            with self.subTest(mode=name):
+                text = renderer(report)
+                self.assertIn("Second qualifying representative", text)
+
+    def test_no_solid_cluster_suppresses_auxiliary_candidate_sections(self):
+        report = sample_report()
+        report.clusters[0].score = 0
+        report.ranked_candidates[0].title = "Could this rejected take leak?"
+        report.ranked_candidates[0].fun_score = 90
+        second_candidate = copy.deepcopy(report.ranked_candidates[0])
+        second_candidate.candidate_id = "c2"
+        second_candidate.title = "Another rejected but funny take?"
+        second_candidate.fun_score = 80
+        report.ranked_candidates.append(second_candidate)
+        report.clusters[0].candidate_ids.append("c2")
+        report.clusters[0].representative_ids.append("c2")
+
+        renderers = {
+            "compact": render.render_compact,
+            "comparison": lambda value: render.render_comparison_multi(
+                [("Example", value)]
+            ),
+            "full": render.render_full,
+            "brief": render.render_brief,
+        }
+        for name, renderer in renderers.items():
+            with self.subTest(mode=name):
+                text = renderer(report)
+                self.assertIn("Nothing solid this window.", text)
+                self.assertNotIn("## Best Takes", text)
+                self.assertNotIn("## Narrative Hooks", text)
+                self.assertNotIn("## Audience Questions", text)
+
+    def test_rejected_cluster_cannot_feed_auxiliary_sections(self):
+        report = sample_report()
+        rejected_item = copy.deepcopy(report.ranked_candidates[0].source_items[0])
+        rejected_item.item_id = "rejected-reddit"
+        rejected_item.url = "https://example.com/rejected"
+        rejected_item.metadata["top_comments"] = [
+            {"excerpt": "Rejected comment one must remain hidden.", "score": 99},
+            {"excerpt": "Rejected comment two must remain hidden.", "score": 98},
+        ]
+        rejected_candidate = copy.deepcopy(report.ranked_candidates[0])
+        rejected_candidate.candidate_id = "c-rejected"
+        rejected_candidate.item_id = rejected_item.item_id
+        rejected_candidate.title = "Could rejected evidence become a question?"
+        rejected_candidate.url = rejected_item.url
+        rejected_candidate.fun_score = 95
+        rejected_candidate.source_items = [rejected_item]
+
+        job_item = schema.SourceItem(
+            item_id="rejected-job",
+            source="jobs",
+            title="Rejected Strategic Engineer",
+            body="Founding enterprise security role.",
+            url="https://example.com/jobs/rejected",
+            container="Engineering",
+            published_at="2026-03-15",
+            metadata={"department": "Engineering"},
+        )
+        job_candidate = copy.deepcopy(rejected_candidate)
+        job_candidate.candidate_id = "c-rejected-job"
+        job_candidate.item_id = job_item.item_id
+        job_candidate.source = "jobs"
+        job_candidate.title = job_item.title
+        job_candidate.url = job_item.url
+        job_candidate.fun_score = None
+        job_candidate.source_items = [job_item]
+        report.ranked_candidates.extend([rejected_candidate, job_candidate])
+        report.clusters.append(schema.Cluster(
+            cluster_id="cluster-rejected",
+            title="Rejected cluster",
+            candidate_ids=["c-rejected", "c-rejected-job"],
+            representative_ids=["c-rejected"],
+            sources=["reddit", "jobs"],
+            score=0,
+        ))
+        report.artifacts["hiring_signals"] = hiring_signals.analyze(
+            [job_item],
+            explicit=True,
+            topic=report.topic,
+        )
+
+        renderers = {
+            "compact": render.render_compact,
+            "registered": lambda value: render.render_compact(
+                value,
+                register="creator",
+            ),
+            "context": render.render_context,
+            "brief": render.render_brief,
+        }
+        for name, renderer in renderers.items():
+            with self.subTest(mode=name):
+                text = renderer(report)
+                self.assertIn("Grounded result", text)
+                self.assertNotIn("Rejected comment", text)
+                self.assertNotIn("Could rejected evidence", text)
+                self.assertNotIn("Rejected Strategic Engineer", text)
+
+    def test_all_report_modes_promote_qualifying_nonrepresentative(self):
+        renderers = {
+            "comparison": lambda report: render.render_comparison_multi(
+                [("Example", report)]
+            ),
+            "full": render.render_full,
+            "context": render.render_context,
+            "brief": render.render_brief,
+        }
+
+        for name, renderer in renderers.items():
+            with self.subTest(mode=name):
+                text = renderer(mixed_representative_report())
+                self.assertNotIn("Nothing solid this window.", text)
+                self.assertIn("Solid nonrepresentative evidence", text)
+
+    def test_comparison_context_suppresses_all_miss_cluster(self):
+        report = sample_report()
+        report.ranked_candidates[0].final_score = 14
+        report.ranked_candidates[0].explanation = (
+            "fallback-local-score (entity-miss demotion)"
+        )
+        report.clusters[0].score = 72
+
+        text = render.render_comparison_multi_context([("Example", report)])
+
+        self.assertIn("Nothing solid this window.", text)
+        self.assertNotIn("- Grounded result [", text)
 
 
 class OutputEnvelopeTests(unittest.TestCase):
@@ -266,6 +485,62 @@ class OutputEnvelopeTests(unittest.TestCase):
         self.assertEqual(
             text.count("<!-- PASS-THROUGH FOOTER:"),
             text.count("<!-- END PASS-THROUGH FOOTER -->"),
+        )
+
+
+class SynthesisDirectiveSurvivesTruncationTests(unittest.TestCase):
+    """Issue #726: a host that truncates the engine's stdout (`| head -N`,
+    timeout-backgrounding, scrollback caps) used to lose the synthesis
+    instructions entirely, because the only strong directive lived at the
+    `# END OF last30days CANONICAL OUTPUT` boundary AFTER the whole evidence
+    block. Left holding only raw `### N.` clusters with no directive, the host
+    dumps them — the LAW 6 failure mode. A concise synthesis contract must
+    therefore ALSO appear at the TOP of the evidence, in the region that
+    survives head-truncation.
+    """
+
+    def _head_before_clusters(self, text: str) -> str:
+        # Everything a `engine | head -N` capture keeps when N lands inside the
+        # evidence block: the badge, metadata, and the directive must live here.
+        return text[: text.index("## Ranked Evidence Clusters")]
+
+    def test_synthesis_contract_present_before_evidence_block(self):
+        head = self._head_before_clusters(render.render_compact(sample_report()))
+        self.assertIn("SYNTHESIS CONTRACT", head)
+
+    def test_early_directive_restates_what_i_learned_and_dump_self_check(self):
+        head = self._head_before_clusters(render.render_compact(sample_report()))
+        # LAW 2 target shape...
+        self.assertIn("What I learned:", head)
+        # ...and the concrete "do not emit the cluster headings" self-check, so
+        # the directive is actionable without the tail boundary.
+        self.assertIn("### N.", head)
+        self.assertIn("PASS-THROUGH FOOTER", head)
+
+    def test_early_directive_sits_inside_evidence_envelope(self):
+        # It is a model instruction, not user output, so it belongs in the
+        # read-don't-emit zone (after the open comment, before the close).
+        text = render.render_compact(sample_report())
+        open_idx = text.index("<!-- EVIDENCE FOR SYNTHESIS:")
+        close_idx = text.index("<!-- END EVIDENCE FOR SYNTHESIS -->")
+        marker = text.index("SYNTHESIS CONTRACT")
+        self.assertLess(open_idx, marker)
+        self.assertLess(marker, close_idx)
+
+    def test_comparison_render_also_carries_early_directive(self):
+        report = sample_report()
+        text = render.render_comparison_multi([("Topic A", report), ("Topic B", report)])
+        self.assertIn("SYNTHESIS CONTRACT", text)
+        # Survive head-truncation: the directive must precede the FIRST entity
+        # evidence cluster heading (H3 in the comparison path), not merely the
+        # envelope close tag — that is the real point a `| head -N` capture cuts.
+        self.assertLess(
+            text.index("SYNTHESIS CONTRACT"),
+            text.index("### Ranked Evidence Clusters"),
+        )
+        self.assertLess(
+            text.index("SYNTHESIS CONTRACT"),
+            text.index("<!-- END EVIDENCE FOR SYNTHESIS -->"),
         )
 
 
@@ -759,6 +1034,7 @@ class RenderBriefTests(unittest.TestCase):
             source_items=[],
         )
         report.ranked_candidates.append(question_candidate)
+        report.clusters[0].candidate_ids.append("cq")
         text = render.render_brief(report)
         self.assertIn("## Audience Questions", text)
         self.assertIn("What are the best prompting tricks for Claude?", text)
@@ -793,6 +1069,7 @@ class RenderBriefTests(unittest.TestCase):
                 source_quality=0.8, rrf_score=0.01, final_score=70,
                 sources=["reddit"], source_items=[],
             ))
+            report.clusters[0].candidate_ids.append(f"cdup{i}")
         text = render.render_brief(report)
         self.assertEqual(text.count("What is the best approach?"), 1)
 
@@ -969,6 +1246,65 @@ class TranscriptCaveatTests(unittest.TestCase):
         )
 
 
+class TestUntrustedEvidenceSanitization(unittest.TestCase):
+    """Scraped markdown must not mint structural ## headings in evidence (#874)."""
+
+    def test_format_untrusted_evidence_indents_and_escapes_headings(self):
+        raw = (
+            "Sales Operations Key Account Manager at Traeger Grills · JobsRadar\n"
+            "\n"
+            "Jobs› Companies› Traeger Grills\n"
+            "\n"
+            "## About this Sales Operations Key Account Manager role at Traeger Grills\n"
+            "\n"
+            "Traeger Grills · Onsite · Salt Lake City, UT"
+        )
+        formatted = render._format_untrusted_evidence(raw, 360)
+        self.assertNotRegex(formatted, r"(?m)^## ")
+        self.assertIn(r"\#\# About this Sales Operations", formatted)
+        # Continuation lines stay under the Evidence bullet indent.
+        for line in formatted.splitlines()[1:]:
+            self.assertTrue(line.startswith("     ") or line == "     ")
+
+    def test_render_candidate_evidence_has_no_column_zero_heading(self):
+        item = schema.SourceItem(
+            item_id="j1",
+            source="jobs",
+            title="Sales Operations Key Account Manager",
+            body="body",
+            url="https://jobs-radar.com/job/example",
+            published_at="2026-07-01",
+            date_confidence="high",
+            engagement={},
+            snippet=(
+                "Sales Operations role\n\n"
+                "## About this Sales Operations Key Account Manager role at Traeger Grills\n"
+                "Welcome To The Traegerhood"
+            ),
+        )
+        candidate = schema.Candidate(
+            candidate_id="c1",
+            item_id=item.item_id,
+            source="jobs",
+            title=item.title,
+            url=item.url,
+            snippet=item.snippet,
+            subquery_labels=["primary"],
+            native_ranks={"jobs": 1},
+            local_relevance=1.0,
+            freshness=1,
+            engagement=1,
+            source_quality=1.0,
+            rrf_score=1.0,
+            sources=["jobs"],
+            source_items=[item],
+        )
+        text = "\n".join(render._render_candidate(candidate, "1."))
+        self.assertIn("   - Evidence:", text)
+        self.assertNotRegex(text, r"(?m)^## ")
+        self.assertIn(r"\#\# About this Sales Operations", text)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1033,6 +1369,30 @@ class TestRenderTopCommentsBlock(unittest.TestCase):
         text = render.render_compact(report)
         block = text.split("## Top Community Comments", 1)[1]
         self.assertIn("TurkiYe", block)
+
+    def test_excludes_comments_from_entity_miss_candidate_in_mixed_report(self):
+        missed = self._cand(
+            "missed",
+            "reddit",
+            5000,
+            "viral but unrelated entity-miss comment",
+        )
+        missed.final_score = 0
+        missed.explanation = "fallback-local-score (entity-miss demotion)"
+        report = self._report(
+            [
+                missed,
+                self._cand("good-a", "reddit", 100, "first relevant comment here"),
+                self._cand("good-b", "reddit", 90, "second relevant comment here"),
+            ],
+            representative_ids=["good-a"],
+        )
+
+        block = "\n".join(render._render_top_comments(report))
+
+        self.assertNotIn("viral but unrelated", block)
+        self.assertIn("first relevant comment", block)
+        self.assertIn("second relevant comment", block)
 
     def test_block_inside_evidence_envelope(self):
         report = self._report(
@@ -1170,3 +1530,253 @@ class TestPolymarketTopMarkets(unittest.TestCase):
         item = self._pm_item("Who wins the primary?", "Kanye", 0.12)
         line = render._polymarket_top_markets([item])[0]
         self.assertIn(": Kanye ", line)
+
+
+class TestMarkdownUrlLinkSafety(unittest.TestCase):
+    """Greptile follow-up on #886/#912: source URLs are untrusted API
+    responses, not authored content -- must not be embedded verbatim into
+    markdown link syntax without checking for characters/schemes that would
+    corrupt or misuse it."""
+
+    def test_plain_https_url_becomes_a_link(self):
+        self.assertEqual(
+            render._markdown_url_link("https://example.com/thread"),
+            "[https://example.com/thread](https://example.com/thread)",
+        )
+
+    def test_url_with_closing_paren_falls_back_to_plain_text(self):
+        # A `)` in the URL would prematurely close the markdown destination.
+        url = "https://example.com/wiki/Foo_(bar)"
+        result = render._markdown_url_link(url)
+        self.assertEqual(result, r"https\://example\.com/wiki/Foo\_\(bar\)")
+        self.assertNotIn("](", result)
+
+    def test_url_with_bracket_falls_back_to_plain_text(self):
+        url = "https://example.com/search?q=[test]"
+        self.assertEqual(
+            render._markdown_url_link(url),
+            r"https\://example\.com/search?q=\[test\]",
+        )
+
+    def test_non_http_scheme_falls_back_to_plain_text(self):
+        # Untrusted scheme (e.g. javascript:) must never become an active link.
+        url = "javascript:alert(1)"
+        self.assertEqual(render._markdown_url_link(url), r"javascript\:alert\(1\)")
+
+    def test_url_with_backslash_falls_back_to_plain_text(self):
+        # A backslash can escape adjacent markdown delimiters.
+        url = "https://example.com/\\]"
+        result = render._markdown_url_link(url)
+        self.assertEqual(result, "https\\://example\\.com/\\\\\\]")
+        self.assertNotIn("](", result)
+
+    def test_embedded_markdown_link_is_escaped_as_plain_text(self):
+        result = render._markdown_url_link("[click](javascript:alert)")
+        self.assertEqual(result, r"\[click\]\(javascript\:alert\)")
+        self.assertNotIn("[click](javascript:alert)", result)
+
+    def test_angle_autolink_and_raw_html_are_encoded(self):
+        autolink = render._markdown_url_link("<javascript:alert(1)>")
+        raw_html = render._markdown_url_link(
+            '<a href="javascript:alert(1)">click</a>'
+        )
+        self.assertEqual(autolink, r"&lt;javascript\:alert\(1\)&gt;")
+        self.assertNotIn("<a ", raw_html)
+        self.assertIn("&lt;a href=", raw_html)
+
+    def test_http_url_with_raw_html_delimiters_is_plain_text(self):
+        result = render._markdown_url_link("https://example.com/<script>")
+        self.assertEqual(result, r"https\://example\.com/&lt;script&gt;")
+        self.assertNotIn("](", result)
+
+    def test_embedded_newline_is_stripped_even_from_plain_text_fallback(self):
+        """Greptile follow-up: an embedded newline/CR must not survive into
+        the rendered line at all -- whether or not the URL becomes a link --
+        since it could otherwise inject fabricated report structure (fake
+        headings, list items) into the single-line output."""
+        url = "https://example.com/x\n## Injected Heading\nmore"
+        result = render._markdown_url_link(url)
+        self.assertNotIn("\n", result)
+        url_cr = "https://example.com/x\r\nmore"
+        self.assertNotIn("\r", render._markdown_url_link(url_cr))
+        self.assertNotIn("\n", render._markdown_url_link(url_cr))
+        self.assertNotIn("##", result)
+        self.assertNotEqual(result, url)
+
+    def test_url_with_controls_is_escaped_and_single_line(self):
+        url = "https://example.com/x\t\x00\u2028more"
+        result = render._markdown_url_link(url)
+        self.assertNotEqual(result, url)
+        self.assertNotIn("\t", result)
+        self.assertNotIn("\x00", result)
+        self.assertNotIn("](", result)
+
+    def test_safe_url_with_query_fragment_and_encoded_delimiters_stays_clickable(self):
+        url = "https://example.com/search?q=one&other=two%28x%29#result"
+        self.assertEqual(
+            render._markdown_url_link(url),
+            f"[{url}]({url})",
+        )
+
+    def test_malformed_or_unsafe_destinations_are_escaped(self):
+        for url in (
+            "data:text/plain,hello",
+            "vbscript:alert(1)",
+            "file:///tmp/report.md",
+            "mailto:user@example.com",
+            "//evil.example/path",
+            "https:example.com/path",
+            " https://example.com/path ",
+        ):
+            with self.subTest(url=url):
+                result = render._markdown_url_link(url)
+                self.assertNotEqual(result, url)
+                self.assertNotIn("](", result)
+
+    def test_empty_url_returns_empty_string(self):
+        self.assertEqual(render._markdown_url_link(""), "")
+        self.assertEqual(render._markdown_url_link(" \t\r\n"), "")
+        self.assertEqual(render._markdown_url_link("\x00\u2028"), "")
+
+
+class TestSourceUrlsAreClickable(unittest.TestCase):
+    """Regression for #886: source URLs rendered as plain text instead of
+    markdown links in the saved raw report and internal evidence block."""
+
+    def test_all_items_by_source_url_is_markdown_link(self):
+        text = render.render_full(sample_report())
+        self.assertIn("[https://example.com](https://example.com)", text)
+        # No bare unlinked URL line remains for the item that has one.
+        self.assertNotIn("\n  https://example.com\n", text)
+
+    def test_all_items_by_source_empty_url_renders_no_url_line(self):
+        report = sample_report()
+        empty_url_item = schema.SourceItem(
+            item_id="i3",
+            source="perplexity",
+            title="Perplexity Sonar Pro: test topic",
+            body="AI synthesis body.",
+            url="",
+            container="perplexity.ai",
+            published_at="2026-03-16",
+            date_confidence="high",
+            engagement={"citations": 3},
+            metadata={},
+        )
+        report.items_by_source["perplexity"] = [empty_url_item]
+        text = render.render_full(report)
+        self.assertNotIn("[]()", text)
+
+    def test_all_items_by_source_whitespace_url_renders_no_url_line(self):
+        report = sample_report()
+        report.items_by_source["grounding"][0].url = " \t\r\n"
+        text = render.render_full(report)
+        all_items = text.split("## All Items by Source", 1)[1]
+        self.assertNotIn("URL:", all_items)
+        self.assertNotIn("[]()", all_items)
+
+    def test_all_items_by_source_unsafe_url_is_escaped(self):
+        report = sample_report()
+        report.items_by_source["grounding"][0].url = "https://example.test/[click](javascript:alert(1))"
+        text = render.render_full(report)
+        all_items = text.split("## All Items by Source", 1)[1]
+        url_lines = [line for line in all_items.splitlines() if "click" in line]
+        self.assertEqual(len(url_lines), 1)
+        self.assertNotIn("](", url_lines[0])
+        self.assertIn(r"\[click\]\(javascript\:alert\(1\)\)", url_lines[0])
+
+    def test_all_items_by_source_newline_url_cannot_create_structure(self):
+        report = sample_report()
+        report.items_by_source["grounding"][0].url = "https://example.test/x\n## forged heading\n- forged item"
+        text = render.render_full(report)
+        self.assertNotIn("\n## forged heading", text)
+        self.assertNotIn("\n- forged item", text)
+        self.assertNotIn("\n  https://example.test/x", text)
+
+    def test_all_items_by_source_rejected_url_is_inert_plain_text(self):
+        report = sample_report()
+        report.items_by_source["reddit"][0].url = "[click](javascript:alert)"
+        text = render.render_full(report)
+        self.assertIn(r"  \[click\]\(javascript\:alert\)", text)
+        self.assertNotIn("[click](javascript:alert)", text)
+
+    def test_render_candidate_url_is_markdown_link(self):
+        candidate = schema.Candidate(
+            candidate_id="c1", item_id="i1", source="reddit",
+            title="Grounded result", url="https://example.com/thread",
+            snippet="A snippet.", subquery_labels=["primary"],
+            native_ranks={"reddit": 1}, local_relevance=1.0, freshness=1,
+            engagement=100, source_quality=1.0, rrf_score=1.0,
+            sources=["reddit"], source_items=[],
+        )
+        text = "\n".join(render._render_candidate(candidate, "1."))
+        self.assertIn(
+            "URL: [https://example.com/thread](https://example.com/thread)", text
+        )
+
+    def test_render_candidate_rejected_url_is_inert_plain_text(self):
+        candidate = schema.Candidate(
+            candidate_id="c1", item_id="i1", source="reddit",
+            title="Grounded result", url="<javascript:alert(1)>",
+            snippet="A snippet.", subquery_labels=["primary"],
+            native_ranks={"reddit": 1}, local_relevance=1.0, freshness=1,
+            engagement=100, source_quality=1.0, rrf_score=1.0,
+            sources=["reddit"], source_items=[],
+        )
+        text = "\n".join(render._render_candidate(candidate, "1."))
+        self.assertIn(r"URL: &lt;javascript\:alert\(1\)&gt;", text)
+        self.assertNotIn("<javascript:", text)
+
+    def test_render_candidate_empty_url_renders_no_url_line(self):
+        """Regression: unlike the item-loop location, _render_candidate had
+        no guard at all -- an empty candidate.url produced a broken `[]()`."""
+        candidate = schema.Candidate(
+            candidate_id="c1", item_id="i1", source="perplexity",
+            title="Grounded result", url="",
+            snippet="A snippet.", subquery_labels=["primary"],
+            native_ranks={"perplexity": 1}, local_relevance=1.0, freshness=1,
+            engagement=100, source_quality=1.0, rrf_score=1.0,
+            sources=["perplexity"], source_items=[],
+        )
+        text = "\n".join(render._render_candidate(candidate, "1."))
+        self.assertNotIn("[]()", text)
+        self.assertNotIn("URL:", text)
+
+    def test_render_candidate_whitespace_url_renders_no_url_line(self):
+        candidate = schema.Candidate(
+            candidate_id="c1", item_id="i1", source="perplexity",
+            title="Grounded result", url=" \t\r\n",
+            snippet="A snippet.", subquery_labels=["primary"],
+            native_ranks={"perplexity": 1}, local_relevance=1.0, freshness=1,
+            engagement=100, source_quality=1.0, rrf_score=1.0,
+            sources=["perplexity"], source_items=[],
+        )
+        text = "\n".join(render._render_candidate(candidate, "1."))
+        self.assertNotIn("URL:", text)
+        self.assertNotIn("[]()", text)
+
+    def test_render_candidate_unsafe_url_is_escaped(self):
+        candidate = schema.Candidate(
+            candidate_id="c1", item_id="i1", source="perplexity",
+            title="Grounded result", url="javascript:alert(1)",
+            snippet="A snippet.", subquery_labels=["primary"],
+            native_ranks={"perplexity": 1}, local_relevance=1.0, freshness=1,
+            engagement=100, source_quality=1.0, rrf_score=1.0,
+            sources=["perplexity"], source_items=[],
+        )
+        text = "\n".join(render._render_candidate(candidate, "1."))
+        self.assertIn(r"URL: javascript\:alert\(1\)", text)
+        self.assertNotIn("](", text)
+
+    def test_render_candidate_newline_url_cannot_create_structure(self):
+        candidate = schema.Candidate(
+            candidate_id="c1", item_id="i1", source="perplexity",
+            title="Grounded result", url="https://example.test/x\n## forged heading",
+            snippet="A snippet.", subquery_labels=["primary"],
+            native_ranks={"perplexity": 1}, local_relevance=1.0, freshness=1,
+            engagement=100, source_quality=1.0, rrf_score=1.0,
+            sources=["perplexity"], source_items=[],
+        )
+        text = "\n".join(render._render_candidate(candidate, "1."))
+        self.assertNotIn("\n## forged heading", text)
+        self.assertNotIn("URL: [", text)

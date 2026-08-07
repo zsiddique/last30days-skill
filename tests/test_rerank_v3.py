@@ -277,6 +277,149 @@ class EntityGroundingTests(unittest.TestCase):
         self.assertNotIn("Primary entity grounding", prompt)
 
 
+class FallbackVisibilityTests(unittest.TestCase):
+    """Only low-confidence fallback entity misses with no raw-topic anchor are
+    hidden from synthesized evidence; adjacent and explicitly scoped evidence
+    remains available."""
+
+    topic = (
+        "best durable execution architecture for AI coding agents and "
+        "alternatives to Temporal"
+    )
+
+    def _candidate(
+        self,
+        *,
+        title: str,
+        snippet: str,
+        local_relevance: float,
+        explanation: str,
+        source: str = "youtube",
+    ) -> schema.Candidate:
+        candidate = schema.Candidate(
+            candidate_id=f"{source}-{title[:18]}",
+            item_id="i1",
+            source=source,
+            title=title,
+            url="https://example.com/item",
+            snippet=snippet,
+            subquery_labels=["primary"],
+            native_ranks={f"primary:{source}": 1},
+            local_relevance=local_relevance,
+            freshness=80,
+            engagement=50,
+            source_quality=0.7,
+            rrf_score=0.02,
+        )
+        candidate.explanation = explanation
+        candidate.final_score = 14.0
+        return candidate
+
+    def test_prunes_only_unanchored_low_confidence_fallback_entity_miss(self):
+        starship = self._candidate(
+            title=(
+                "Everyone Mocked the Boy, Until He Awakened a Starship System "
+                "and Built a Powerful Fleet From Scrap!"
+            ),
+            snippet=(
+                "A simulation assessment projected a meteorite shattering the "
+                "ship's hull while classmates laughed."
+            ),
+            local_relevance=0.38,
+            explanation="fallback-local-score (entity-miss demotion)",
+        )
+        adjacent = self._candidate(
+            title="Fable AI coding workflow exhausts weekly API limits",
+            snippet="The system spawns up to 40 subagents simultaneously for execution.",
+            local_relevance=0.31,
+            explanation="fallback-local-score (entity-miss demotion)",
+            source="digg",
+        )
+        scoped_project = self._candidate(
+            title="hatchet-dev/hatchet",
+            snippet="Project repository",
+            local_relevance=0.8,
+            explanation="fallback-local-score (entity-miss demotion)",
+            source="github",
+        )
+        ordinary_fallback = self._candidate(
+            title="Unrelated wording",
+            snippet="No raw topic terms here",
+            local_relevance=0.2,
+            explanation="fallback-local-score",
+        )
+        incidental_metadata = self._candidate(
+            title="A completely unrelated film discussion",
+            snippet="No connection to the requested workflow.",
+            local_relevance=0.38,
+            explanation="fallback-local-score (entity-miss demotion)",
+            source="reddit",
+        )
+        incidental_metadata.metadata = {
+            "transcript_snippet": "One speaker briefly says agents.",
+            "top_comments": [{"excerpt": "Execution was the best part."}],
+        }
+        generic_title = self._candidate(
+            title="Best starship story this month",
+            snippet="A boy builds a fleet from scrap.",
+            local_relevance=0.38,
+            explanation="fallback-local-score (entity-miss demotion)",
+            source="x",
+        )
+        # Corpus titles are often filenames; retrieval may have matched body text
+        # that never lands in title/snippet, so local_relevance can sit below the
+        # public escape floor without meaning the document is off-topic.
+        corpus_body_match = self._candidate(
+            title="meeting-notes.md",
+            snippet="Agenda and follow-ups from last week.",
+            local_relevance=0.22,
+            explanation="fallback-local-score (entity-miss demotion)",
+            source="corpus",
+        )
+
+        kept = rerank.prune_fallback_entity_misses(
+            [
+                starship,
+                adjacent,
+                scoped_project,
+                ordinary_fallback,
+                incidental_metadata,
+                generic_title,
+                corpus_body_match,
+            ],
+            topic=self.topic,
+        )
+
+        self.assertNotIn(starship, kept)
+        self.assertNotIn(incidental_metadata, kept)
+        self.assertNotIn(generic_title, kept)
+        self.assertIn(adjacent, kept)
+        self.assertIn(scoped_project, kept)
+        self.assertIn(ordinary_fallback, kept)
+        self.assertIn(corpus_body_match, kept)
+
+    def test_keeps_fused_candidate_with_corpus_source_item(self):
+        fused = self._candidate(
+            title="weekly-summary.md",
+            snippet="No head token in the extracted window.",
+            local_relevance=0.18,
+            explanation="fallback-local-score (entity-miss demotion)",
+            source="web",
+        )
+        fused.source_items = [
+            schema.SourceItem(
+                item_id="c1",
+                source="corpus",
+                title="weekly-summary.md",
+                url="corpus://abc",
+                body="Notes on durable execution architecture for AI coding agents.",
+            )
+        ]
+
+        kept = rerank.prune_fallback_entity_misses([fused], topic=self.topic)
+
+        self.assertIn(fused, kept)
+
 class ExpandedHaystackTests(unittest.TestCase):
     """Unit 3: Entity-grounding haystack covers transcript snippets,
     transcript highlights, top comments, and comment insights - not

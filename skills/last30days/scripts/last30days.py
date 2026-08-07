@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# fmt: off
 # ruff: noqa: E402
 """last30days CLI."""
 
@@ -7,6 +8,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -14,6 +16,7 @@ import signal
 import sqlite3
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 MIN_PYTHON = (3, 12)
@@ -48,7 +51,7 @@ if os.name == "nt":
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from lib import corpus, dates, env, freshness, html_render, http, permission_preflight, pipeline, registers, render, schema, ui
+from lib import competitors as competitors_mod, corpus, dates, discovery_handoff, env, freshness, html_render, http, permission_preflight, pipeline, registers, render, schema, ui
 
 _child_pids: set[int] = set()
 _child_pids_lock = threading.Lock()
@@ -116,8 +119,69 @@ def resolve_requested_sources(args_search: str | None, config: dict) -> list[str
     return None
 
 
-def slugify(value: str) -> str:
+def plan_has_explicit_trustpilot_domain(comp_plan: dict | None) -> bool:
+    """True when any --competitors-plan entry pins a trustpilot_domain."""
+    if not comp_plan:
+        return False
+    for entry in comp_plan.values():
+        if not isinstance(entry, dict):
+            continue
+        domain = entry.get("trustpilot_domain")
+        if isinstance(domain, str) and domain.strip():
+            return True
+    return False
+
+
+def activate_trustpilot_for_explicit_domain(
+    config: dict,
+    requested_sources: list[str] | None,
+    *,
+    reason: str,
+) -> list[str] | None:
+    """Activate the opt-in Trustpilot source when the user pinned a domain.
+
+    Passing ``--trustpilot-domain`` (or a plan-level ``trustpilot_domain``) is
+    unambiguous intent — silently ignoring it when Trustpilot is not in
+    ``INCLUDE_SOURCES`` / ``--search`` is the #873 failure mode. Auto-resolve
+    hints must not call this helper.
+
+    ``EXCLUDE_SOURCES=trustpilot`` still wins. Mutates ``config`` in place and
+    returns the (possibly extended) ``requested_sources`` list.
+    """
+    excluded = {
+        token.strip().lower()
+        for token in str(config.get("EXCLUDE_SOURCES") or "").split(",")
+        if token.strip()
+    }
+    if "trustpilot" in excluded:
+        sys.stderr.write(
+            f"[Trustpilot] {reason} ignored: trustpilot is in EXCLUDE_SOURCES\n"
+        )
+        return requested_sources
+
+    include = str(config.get("INCLUDE_SOURCES") or "")
+    tokens = [token.strip() for token in include.split(",") if token.strip()]
+    if "trustpilot" not in {token.lower() for token in tokens}:
+        tokens.append("trustpilot")
+        config["INCLUDE_SOURCES"] = ",".join(tokens)
+        sys.stderr.write(
+            f"[Trustpilot] {reason} activated trustpilot source "
+            "(add to INCLUDE_SOURCES permanently to skip this auto-enable)\n"
+        )
+
+    if requested_sources is not None and "trustpilot" not in requested_sources:
+        requested_sources = [*requested_sources, "trustpilot"]
+    return requested_sources
+
+
+def slugify(value: str, max_length: int = 180) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    if len(slug) > max_length:
+        # Filenames built from long topics can exceed the OS 255-byte limit
+        # (macOS errno 63). Truncate and append a hash of the full value so
+        # distinct long topics still get distinct, deterministic names.
+        digest = hashlib.sha1(slug.encode("utf-8")).hexdigest()[:10]
+        slug = f"{slug[:max_length].rstrip('-')}-{digest}"
     return slug or "last30days"
 
 
@@ -160,6 +224,7 @@ def save_output(
     json_profile: str = "agent",
     register: str = "default",
     private: bool | None = None,
+    render_fn: Callable[[Path], str] | None = None,
 ) -> Path:
     from datetime import datetime
     path = Path(save_dir).expanduser().resolve()
@@ -175,21 +240,24 @@ def save_output(
         candidates.append(path / f"{slug}-{raw_label}{suffix_part}-{date_str}-{i}.{extension}")
     # Markdown saves keep the complete debug artifact. JSON and HTML preserve
     # their requested wire format so file extensions match their content.
-    if rendered_content is not None:
-        content = rendered_content
-    elif emit in {"json", "html"}:
-        content = emit_output(
-            report,
-            emit,
-            synthesis_md=synthesis_md,
-            json_profile=json_profile,
-            register=register,
-        )
-    else:
-        content = render.render_full(report)
+    # When render_fn is supplied, content is produced after O_EXCL allocates
+    # the candidate. This lets the footer cite the file actually written
+    # without racing a separate filesystem probe.
+    if render_fn is None:
+        if rendered_content is not None:
+            static_content = rendered_content
+        elif emit in {"json", "html"}:
+            static_content = emit_output(
+                report,
+                emit,
+                synthesis_md=synthesis_md,
+                json_profile=json_profile,
+                register=register,
+            )
+        else:
+            static_content = render.render_full(report)
     private_corpus = _report_has_private_corpus(report) or bool(private)
     _ensure_output_directory(path, private=private_corpus)
-    encoded = content.encode("utf-8")
     for candidate in candidates:
         try:
             fd = os.open(
@@ -199,8 +267,18 @@ def save_output(
             )
         except FileExistsError:
             continue
-        with os.fdopen(fd, "wb") as f:
-            f.write(encoded)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                content = render_fn(candidate) if render_fn is not None else static_content
+                f.write(content.encode("utf-8"))
+        except BaseException:
+            # Deferred rendering happens after the candidate is reserved. Do
+            # not leave an empty or partial report if rendering or writing fails.
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         if candidate.suffix.lower() == ".md":
             try:
                 from lib import library, library_index
@@ -524,6 +602,41 @@ def build_parser() -> argparse.ArgumentParser:
             "evidence only (faster, thinner; the confidence floor still applies)"
         ),
     )
+    parser.add_argument(
+        "--nominate-only",
+        action="store_true",
+        help=(
+            "Leg 1 of the host-judged discovery protocol: sweep, write the "
+            "nominations bundle for host judgment, and stop (no judging, no "
+            "enrichment). Requires --discover"
+        ),
+    )
+    parser.add_argument(
+        "--judgments",
+        metavar="PATH",
+        help=(
+            "Leg 2 of the discovery protocol: resume from the nominations "
+            "bundle, applying the host judgments file at PATH. Requires "
+            "--discover"
+        ),
+    )
+    parser.add_argument(
+        "--finalize",
+        action="store_true",
+        help=(
+            "Leg 3 of the discovery protocol: apply host angles, render the "
+            "final discovery brief, and record the topic queue. Requires "
+            "--discover"
+        ),
+    )
+    parser.add_argument(
+        "--angles",
+        metavar="PATH",
+        help=(
+            "Optional host angles file for --discover --finalize (omitting it "
+            "ships the brief without angle lines)"
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Enable HTTP debug logging")
     parser.add_argument("--mock", action="store_true", help="Use mock retrieval fixtures")
     parser.add_argument(
@@ -564,8 +677,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--x-handle", help="X handle for targeted supplemental search")
     parser.add_argument("--x-related", help="Comma-separated related X handles (searched with lower weight)")
     parser.add_argument("--web-backend", default="auto",
-                        choices=["auto", "brave", "exa", "serper", "parallel", "none"],
-                        help="Web search backend (default: auto, tries Brave then Exa then Serper then Parallel)")
+                        choices=["auto", "brave", "exa", "serper", "parallel", "keyless", "none"],
+                        help="Web search backend (default: auto, tries Brave then Exa then Serper then Parallel; "
+                             "keyless forces the zero-key DuckDuckGo/SearXNG floor)")
     parser.add_argument("--deep-research", action="store_true",
                         help="Use Perplexity Deep Research (~$0.90/query) for in-depth analysis. Requires PERPLEXITY_API_KEY or OPENROUTER_API_KEY.")
     parser.add_argument("--hiring-signals", action="store_true",
@@ -594,11 +708,30 @@ def build_parser() -> argparse.ArgumentParser:
             "When set, --days looks back from this date instead of today."
             ),
     )
+    parser.add_argument("--max-results", dest="max_results", type=int,
+                        help="Override the final ranked-pool cap (pool_limit/rerank_limit) from the depth profile. "
+                             "Use for high-volume topics where the default (deep=60) under-covers. See issue #716.")
+    parser.add_argument("--max-per-source", dest="max_per_source", type=int,
+                        help="Override the per-stream cap (per_stream_limit) applied to each (source, subquery) before "
+                             "pooling. Raising it increases unique-item yield when one source has many relevant items. "
+                             "See issue #716.")
+    parser.add_argument("--max-source-fetches", dest="max_source_fetches", type=int,
+                        help="Override the per-source fetch cap (MAX_SOURCE_FETCHES, default x=2) that limits how many "
+                             "subqueries actually fetch a capped source. Raise it so every X subquery in a multi-angle "
+                             "--plan runs instead of just the first two. See issue #716.")
     parser.add_argument("--auto-resolve", action="store_true",
                         help="Use web search to discover subreddits/handles before planning (for platforms without WebSearch)")
     parser.add_argument("--github-user", help="GitHub username for person-mode search (e.g., steipete)")
     parser.add_argument("--github-repo", help="Comma-separated owner/repo for project-mode search (e.g., openclaw/openclaw,paperclipai/paperclip)")
-    parser.add_argument("--trustpilot-domain", help="Trustpilot review-page domain for the topic (e.g., www.thriftbooks.com). Used verbatim and bypasses the brand-shape gate; find it with `trustpilot-pp-cli search '<name>'`.")
+    parser.add_argument(
+        "--trustpilot-domain",
+        help=(
+            "Trustpilot review-page domain for the topic (e.g., www.thriftbooks.com). "
+            "Used verbatim, bypasses the brand-shape gate, and auto-activates the "
+            "opt-in Trustpilot source for this run (unless EXCLUDE_SOURCES=trustpilot). "
+            "Find the domain with `trustpilot-pp-cli search '<name>'`."
+        ),
+    )
     parser.add_argument(
         "--competitors",
         nargs="?",
@@ -686,7 +819,8 @@ def parse_competitors_plan(raw: str | None) -> dict[str, dict]:
                 f"{sorted(unknown)}; ignoring.\n"
             )
         normalized[entity.strip().lower()] = {
-            k: v for k, v in entry.items() if k in known_fields
+            **{k: v for k, v in entry.items() if k in known_fields},
+            "_name": entity.strip(),
         }
     return normalized
 
@@ -757,16 +891,92 @@ def subrun_kwargs_for(
     }
 
 
-COMPETITORS_MIN = 1
-COMPETITORS_MAX = 6
-COMPETITORS_DEFAULT = 2
+COMPETITORS_MIN = competitors_mod.COMPETITORS_MIN
+COMPETITORS_MAX = competitors_mod.COMPETITORS_MAX
+COMPETITORS_DEFAULT = competitors_mod.COMPETITORS_DEFAULT
+
+
+def truncate_comparison_entities(entities: list[str], *, warn: bool = True) -> list[str]:
+    """Cap a vs-entity list at COMPARISON_ENTITY_MAX; optionally warn on stderr."""
+    ceiling = competitors_mod.COMPARISON_ENTITY_MAX
+    if len(entities) <= ceiling:
+        return list(entities)
+    kept = entities[:ceiling]
+    dropped = entities[ceiling:]
+    if warn:
+        sys.stderr.write(
+            f"[Competitors] vs-topic has {len(entities)} entities; "
+            f"using first {ceiling}, dropped: {', '.join(dropped)}\n"
+        )
+    return kept
+
+
+def apply_vs_competitor_routing(
+    topic: str,
+    *,
+    competitors_flag: int | None,
+    comp_enabled: bool,
+    comp_count: int,
+    comp_explicit: list[str],
+    comp_plan: dict[str, dict] | None = None,
+) -> tuple[str, bool, int, list[str]]:
+    """Apply vs-string / plan routing on top of resolve_competitors_args.
+
+    Precedence for *who* runs:
+      1. ``--competitors-list`` (explicit peers; topic unchanged)
+      2. Pure discover-N (``--competitors`` without list or plan) — topic
+         unchanged, even if it contains ``vs``
+      3. vs-string split (first entity becomes main topic) — used for bare
+         vs-topics and vs-topic + ``--competitors-plan``
+      4. ``--competitors-plan`` keys as peers when there is no vs-string
+         (including when ``--competitors N`` is also set)
+    """
+    from lib import planner as _planner
+
+    if comp_explicit:
+        return topic, True, len(comp_explicit), list(comp_explicit)
+
+    # Preserve discover-N semantics: numeric flag without plan/list must not
+    # rewrite a vs-string into named peers.
+    if competitors_flag is not None and not comp_plan:
+        return topic, True, comp_count, []
+
+    vs_entities = truncate_comparison_entities(
+        _planner._comparison_entities(topic, uncapped=True),
+        warn=True,
+    )
+    if len(vs_entities) >= 2:
+        main, peers = vs_entities[0], vs_entities[1:]
+        sys.stderr.write(
+            f"[Competitors] vs-mode: routing to N-pass fanout: "
+            f"{main} vs {' vs '.join(peers)}\n"
+        )
+        return main, True, len(peers), peers
+
+    if comp_plan:
+        plan_peers = [
+            (entry.get("_name") or key)
+            for key, entry in comp_plan.items()
+        ]
+        plan_peers = [name for name in plan_peers if name]
+        if len(plan_peers) > COMPETITORS_MAX:
+            sys.stderr.write(
+                f"[Competitors] --competitors-plan has {len(plan_peers)} entries, "
+                f"clamping to {COMPETITORS_MAX}.\n"
+            )
+            plan_peers = plan_peers[:COMPETITORS_MAX]
+        return topic, True, len(plan_peers), plan_peers
+
+    return topic, comp_enabled, comp_count, comp_explicit
 
 
 def resolve_competitors_args(args: argparse.Namespace) -> tuple[bool, int, list[str]]:
-    """Normalize --competitors / --competitors-list into (enabled, count, explicit_list).
+    """Normalize competitors flags into (enabled, count, explicit_list).
 
-    - (False, 0, []) when neither flag is set.
-    - An explicit list always wins; count is derived from list length.
+    - (False, 0, []) when neither flag, list, nor plan is set.
+    - An explicit ``--competitors-list`` always wins; count is derived from list length.
+    - ``--competitors-plan`` alone enables mode with an empty peer list; vs-routing
+      fills peers from the vs-string or plan keys.
     - A numeric count outside [1, 6] is clamped with a stderr warning.
     - count <= 0 (explicit) raises SystemExit(2).
     """
@@ -785,8 +995,9 @@ def resolve_competitors_args(args: argparse.Namespace) -> tuple[bool, int, list[
     competitors_flag = args.competitors
     list_present = bool(explicit_list)
     flag_present = competitors_flag is not None
+    plan_present = bool(getattr(args, "competitors_plan", None))
 
-    if not list_present and not flag_present:
+    if not list_present and not flag_present and not plan_present:
         return False, 0, []
 
     if list_present:
@@ -804,19 +1015,22 @@ def resolve_competitors_args(args: argparse.Namespace) -> tuple[bool, int, list[
             count = COMPETITORS_MAX
         return True, count, explicit_list
 
-    # flag_present, no explicit list
-    count = competitors_flag
-    if count < COMPETITORS_MIN:
-        sys.stderr.write(
-            f"[Competitors] --competitors must be >= {COMPETITORS_MIN} (got {count}).\n"
-        )
-        raise SystemExit(2)
-    if count > COMPETITORS_MAX:
-        sys.stderr.write(
-            f"[Competitors] --competitors={count} exceeds max {COMPETITORS_MAX}; clamping.\n"
-        )
-        count = COMPETITORS_MAX
-    return True, count, []
+    if flag_present:
+        count = competitors_flag
+        if count < COMPETITORS_MIN:
+            sys.stderr.write(
+                f"[Competitors] --competitors must be >= {COMPETITORS_MIN} (got {count}).\n"
+            )
+            raise SystemExit(2)
+        if count > COMPETITORS_MAX:
+            sys.stderr.write(
+                f"[Competitors] --competitors={count} exceeds max {COMPETITORS_MAX}; clamping.\n"
+            )
+            count = COMPETITORS_MAX
+        return True, count, []
+
+    # plan_present alone: enable; peers filled by apply_vs_competitor_routing.
+    return True, 0, []
 
 
 def _missing_sources_for_promo(diag: dict[str, object]) -> str | None:
@@ -1276,70 +1490,134 @@ def _save_discovery_output(
     raise RuntimeError("Could not find a unique discovery output filename")
 
 
-def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
-    domain = " ".join(str(args.discover or "").split())
-    # Empty domain = global trending: sweep every river feed's hot list with no
-    # keyword gate. The confidence floor is what keeps junk out, not a keyword.
-    if args.as_of_date:
-        sys.stderr.write(
-            "[last30days] --as-of cannot be used with --discover because discovery "
-            "sweeps current live listings.\n"
-        )
-        return 2
-    if args.emit == "html" or args.publish_html:
-        sys.stderr.write("[last30days] discovery mode does not support HTML publishing yet.\n")
-        return 2
-    if args.store:
-        sys.stderr.write("[last30days] Warning: --store is not used by discovery mode.\n")
-    if args.synthesis_file:
-        sys.stderr.write("[last30days] Warning: --synthesis-file is not used by discovery mode.\n")
+def _pre_run_prior_state(
+    prior: dict[str, object] | None, run_ref: str
+) -> dict[str, object] | None:
+    """Reconstruct the queue state a topic had BEFORE this run identity
+    recorded it.
 
-    requested_sources = resolve_requested_sources(args.search, config)
-    # The user's original source boundary, honored by the per-topic research
-    # passes (which reach beyond the discovery-capable listing feeds - e.g.
-    # Techmeme, arXiv, YouTube, Polymarket). None = every available source.
-    enrich_requested_sources = list(requested_sources) if requested_sources else None
-    if requested_sources:
-        discovery_sources = [
-            source for source in requested_sources
-            if source in pipeline.DISCOVERY_SOURCES
-        ]
-        if not discovery_sources:
-            # A configured source boundary holds even when it leaves nothing
-            # to sweep: silently widening to all feeds would query sources
-            # the user filtered out.
-            origin = "--search" if args.search is not None else "LAST30DAYS_DEFAULT_SEARCH"
-            sys.stderr.write(
-                f"[last30days] {origin} has no discovery-capable sources "
-                f"(unsupported: {', '.join(requested_sources)}); discovery "
-                f"sweeps use: {', '.join(pipeline.DISCOVERY_SOURCES)}. Pass "
-                "--search with one of those (or clear the source filter) to "
-                "run a sweep.\n"
+    A row whose last_run_ref equals THIS run's run_ref was stamped by this
+    very run's own earlier attempt (a finalize retry), so its surface_count
+    already includes this run's surfacing: subtract it and keep the prior's
+    covered state (covered_at intact) so the retry renders exactly like the
+    first attempt did. Only when nothing remains after the subtraction AND
+    the row was never covered is the topic genuinely first-ever (no prior).
+    """
+    if not prior or prior.get("last_run_ref") != run_ref:
+        return prior
+    previously = max(0, int(prior["surface_count"]) - 1)
+    if previously == 0 and prior["status"] != "covered":
+        return None
+    adjusted = dict(prior)
+    adjusted["surface_count"] = previously
+    return adjusted
+
+
+def _annotate_and_record_discovery_queue(
+    report: schema.DiscoveryReport,
+    args: argparse.Namespace,
+    config: dict[str, object],
+    run_ref: str | None = None,
+) -> schema.DiscoveryReport:
+    """Stamp queue annotations onto report topics, then record this surfacing.
+
+    Order matters: annotations describe the queue state BEFORE this run, so
+    each topic is matched first and recorded second. The queue is on by
+    default; the resolved config value LAST30DAYS_DISCOVERY_QUEUE == "off"
+    (env var or .env, via env.get_config) disables it. Scoped runs
+    (--save-dir) write the scoped research.db, never the global one. Runs
+    synchronously after the pipeline returns - this writes disk, so the
+    abandon-on-timeout daemon-thread pattern is forbidden here.
+
+    ``run_ref`` overrides the run identity: the finalize leg passes the
+    pending report's leg-2 run_ref through so a finalize retry records (and
+    annotates) as the SAME run - store.record_discovery_surfacing skips the
+    double-count, and rows this very run identity stamped are not "prior"
+    state, so retries render identically instead of claiming a resurfacing.
+    """
+    queue_setting = str(config.get("LAST30DAYS_DISCOVERY_QUEUE") or "").strip().lower()
+    if queue_setting == "off" or not report.topics:
+        return report
+
+    import dataclasses
+
+    import store
+
+    run_ref = run_ref or f"discover:{report.domain or 'trending'}:{report.generated_at}"
+    as_of = (report.generated_at or "")[:10] or report.range_to
+    annotated: list[schema.DiscoveryTopic] = []
+    with store.scoped_db(_scoped_store_db(args)):
+        store.init_db()
+        # Phase 1: match EVERY topic before recording ANY. Interleaving
+        # match+record in one loop lets topic N fuzzy-match a same-anchor
+        # sibling row this very run recorded seconds earlier, falsely
+        # annotating a first-ever topic as "surfaced 2nd time".
+        # A row stamped by THIS run identity is this run's own earlier
+        # attempt (finalize retry), not prior state: reconstruct the pre-run
+        # state (count minus this run's own surfacing, covered state kept)
+        # so retries render identically for topics WITH history too.
+        priors = [
+            _pre_run_prior_state(prior, run_ref)
+            for prior in (
+                store.match_discovery_topic(topic.name) for topic in report.topics
             )
-            return 2
-        requested_sources = discovery_sources
-    subreddits = (
-        [value.strip().removeprefix("r/") for value in args.subreddits.split(",") if value.strip()]
-        if args.subreddits else None
-    )
-    depth = "deep" if args.deep else "quick" if args.quick else "default"
-    try:
-        report = pipeline.run_discover(
-            domain=domain,
-            config=config,
-            depth=depth,
-            requested_sources=requested_sources,
-            mock=args.mock,
-            subreddits=subreddits,
-            lookback_days=args.lookback_days or 30,
-            as_of_date=args.as_of_date,
-            enrich=not args.discover_shallow,
-            enrich_requested_sources=enrich_requested_sources,
-        )
-    except ValueError as exc:
-        sys.stderr.write(f"[last30days] {exc}\n")
-        return 2
+        ]
+        # Phase 2: record this run's surfacings. A topic whose (possibly
+        # fuzzy) prior row is covered inherits that covered state, so a
+        # user's covered mark survives judge naming drift instead of
+        # silently forking into a fresh uncovered row.
+        for topic, prior in zip(report.topics, priors):
+            inherit_covered_at = None
+            if prior and prior["status"] == "covered":
+                inherit_covered_at = prior["covered_at"] or prior["last_surfaced"]
+            store.record_discovery_surfacing(
+                topic.name,
+                domain=report.domain,
+                run_ref=run_ref,
+                as_of=as_of,
+                inherit_covered_at=inherit_covered_at,
+            )
+    for topic, prior in zip(report.topics, priors):
+        if prior:
+            topic = dataclasses.replace(
+                topic,
+                previously_surfaced_count=prior["surface_count"],
+                last_surfaced=prior["last_surfaced"],
+                covered=prior["status"] == "covered",
+            )
+        annotated.append(topic)
+    return dataclasses.replace(report, topics=annotated)
 
+
+def _record_discovery_queue_safely(
+    report: schema.DiscoveryReport,
+    args: argparse.Namespace,
+    config: dict[str, object],
+    run_ref: str | None = None,
+) -> schema.DiscoveryReport:
+    """Annotate + record the discovery queue, degrading a broken research.db
+    (locked, read-only dir, corrupt) to a stderr warning: a queue failure
+    must never destroy a finished pipeline run or the protocol's final
+    brief. Shared verbatim by the one-shot and finalize paths."""
+    try:
+        return _annotate_and_record_discovery_queue(
+            report, args, config, run_ref=run_ref,
+        )
+    except (sqlite3.Error, OSError) as exc:
+        sys.stderr.write(
+            f"[last30days] Warning: discovery queue unavailable ({exc}); "
+            "continuing without queue annotations.\n"
+        )
+        return report
+
+
+def _emit_and_save_discovery_report(
+    report: schema.DiscoveryReport,
+    args: argparse.Namespace,
+    domain: str,
+) -> None:
+    """Render a discovery report per --emit, honor --output/--save-dir, and
+    print it. Shared verbatim by the one-shot and finalize paths."""
     if args.emit == "json":
         payload = schema.to_dict(report) if args.json_profile == "raw" else schema.to_discovery_export(report)
         rendered = json.dumps(payload, indent=2, sort_keys=True)
@@ -1360,17 +1638,513 @@ def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
         sys.stderr.write(f"[last30days] Saved output to {save_path}\n")
     print(rendered)
 
+
+def _discovery_strict_exit_code(
+    source_status: dict[str, schema.SourceOutcome],
+    config: dict[str, object],
+) -> int:
+    """The ONE LAST30DAYS_STRICT_EXIT evaluation for every discovery
+    invocation - the one-shot and all three protocol legs (issue #384's
+    discovery counterpart). Rendering/output already happened by the time
+    this runs; only the exit code shifts to 3 when strict exit is on and any
+    source outcome is neither clean nor an expected skip."""
     strict = str(config.get("LAST30DAYS_STRICT_EXIT") or "").strip().lower()
-    degraded = [
-        source for source, outcome in report.source_status.items()
+    if strict not in {"1", "true", "yes", "on"}:
+        return 0
+    degraded = sorted(
+        source for source, outcome in (source_status or {}).items()
         if outcome.state not in _STRICT_EXIT_OK_STATES
-    ]
-    if strict in {"1", "true", "yes", "on"} and degraded:
-        sys.stderr.write(
-            f"[last30days] strict-exit: degraded sources: {', '.join(sorted(degraded))}\n"
+    )
+    if not degraded:
+        return 0
+    sys.stderr.write(
+        f"[last30days] strict-exit: degraded sources: {', '.join(degraded)}\n"
+    )
+    sys.stderr.flush()
+    return 3
+
+
+def _require_discover_mock_parity(
+    loaded_mock: bool,
+    args_mock: bool,
+    *,
+    label: str,
+    path: Path | None,
+) -> None:
+    """A protocol leg's --mock flag must match the loaded handoff file's
+    stamped provenance: mock-born state finalized by a real run would fake a
+    real brief from fixture data, and real state finalized by --mock would
+    silently drop the round's queue write. Mismatch is a contract failure
+    (exit 2 via HandoffContractError)."""
+    if bool(loaded_mock) == bool(args_mock):
+        return
+    location = str(path) if path is not None else "(unknown path)"
+    if loaded_mock:
+        raise discovery_handoff.HandoffContractError(
+            f"{label} {location} is mock-born (a --mock leg wrote it): "
+            "mock-born state cannot be finalized by a real run. Re-run this "
+            "leg with --mock, or start a fresh real `--discover "
+            "--nominate-only` sweep."
         )
-        return 3
+    raise discovery_handoff.HandoffContractError(
+        f"{label} {location} was written by a real run: real state "
+        "cannot be finalized by a --mock run. Drop --mock, or start a fresh "
+        "`--discover --nominate-only --mock` sweep."
+    )
+
+
+def _run_queue_list(args: argparse.Namespace, config: dict[str, object]) -> int:
+    """List uncovered surfaced topics from the persistent discovery queue."""
+    import store
+
+    db_path = _scoped_store_db(args)
+    if not Path(db_path or store.DB_PATH).exists():
+        print("Discovery queue is empty - no discovery run has recorded topics yet.")
+        return 0
+    with store.scoped_db(db_path):
+        rows = store.list_discovery_queue(status="surfaced")
+        if not rows:
+            # An existing db with zero queue rows (e.g. created via --store)
+            # means no discovery run has recorded anything - only claim
+            # "every topic is covered" when covered rows actually exist.
+            if store.list_discovery_queue():
+                print("Discovery queue is empty - every surfaced topic is marked covered.")
+            else:
+                print("Discovery queue is empty - no discovery run has recorded topics yet.")
+            return 0
+
+    headers = ("name", "domain", "surface_count", "last_surfaced", "status")
+    table = [
+        (
+            str(row["name"]),
+            str(row["domain"] or "-"),
+            str(row["surface_count"]),
+            str(row["last_surfaced"]),
+            str(row["status"]),
+        )
+        for row in rows
+    ]
+    widths = [
+        max(len(headers[column]), *(len(row[column]) for row in table))
+        for column in range(len(headers))
+    ]
+    lines = [
+        "  ".join(header.ljust(widths[i]) for i, header in enumerate(headers)).rstrip(),
+        "  ".join("-" * widths[i] for i in range(len(headers))),
+    ]
+    lines.extend(
+        "  ".join(row[i].ljust(widths[i]) for i in range(len(headers))).rstrip()
+        for row in table
+    )
+    print("\n".join(lines))
     return 0
+
+
+def _run_queue_cover(
+    args: argparse.Namespace,
+    config: dict[str, object],
+    name: str,
+) -> int:
+    """Mark a queued discovery topic covered; unknown names error loudly."""
+    import store
+
+    if not name:
+        sys.stderr.write(
+            "[last30days] queue cover requires a topic name: "
+            'queue cover "<topic name>".\n'
+        )
+        return 2
+    db_path = _scoped_store_db(args)
+    if not Path(db_path or store.DB_PATH).exists():
+        sys.stderr.write(
+            f"[last30days] No queued topic named {name!r}: the discovery queue "
+            "is empty (no discovery run has recorded topics yet).\n"
+        )
+        return 2
+    with store.scoped_db(db_path):
+        row = store.mark_discovery_covered(
+            name, as_of=datetime.date.today().isoformat()
+        )
+    if row is None:
+        sys.stderr.write(
+            f"[last30days] No queued topic named {name!r}. Covering requires "
+            "the exact topic name; run 'queue list' to see queued names.\n"
+        )
+        return 2
+    print(f"Marked covered: {row['name']} (covered {row['covered_at']})")
+    return 0
+
+
+def _resolve_discovery_source_boundary(
+    args: argparse.Namespace, config: dict[str, object],
+) -> tuple[list[str] | None, list[str] | None] | None:
+    """Resolve the discovery sweep's source lists from the user's boundary.
+
+    Returns ``(listing_sources, enrichment_boundary)`` - the discovery-capable
+    subset for the sweep, and the user's ORIGINAL boundary honored by the
+    per-topic research passes (which reach beyond the listing feeds - e.g.
+    Techmeme, arXiv, YouTube, Polymarket); both None mean every available
+    source. Returns None (after writing the exit-2 error) when the configured
+    boundary leaves nothing to sweep: silently widening to all feeds would
+    query sources the user filtered out.
+    """
+    requested_sources = resolve_requested_sources(args.search, config)
+    enrich_requested_sources = list(requested_sources) if requested_sources else None
+    if requested_sources:
+        discovery_sources = [
+            source for source in requested_sources
+            if source in pipeline.DISCOVERY_SOURCES
+        ]
+        if not discovery_sources:
+            origin = "--search" if args.search is not None else "LAST30DAYS_DEFAULT_SEARCH"
+            sys.stderr.write(
+                f"[last30days] {origin} has no discovery-capable sources "
+                f"(unsupported: {', '.join(requested_sources)}); discovery "
+                f"sweeps use: {', '.join(pipeline.DISCOVERY_SOURCES)}. Pass "
+                "--search with one of those (or clear the source filter) to "
+                "run a sweep.\n"
+            )
+            return None
+        requested_sources = discovery_sources
+    return requested_sources, enrich_requested_sources
+
+
+def _discover_subreddits(args: argparse.Namespace) -> list[str] | None:
+    return (
+        [value.strip().removeprefix("r/") for value in args.subreddits.split(",") if value.strip()]
+        if args.subreddits else None
+    )
+
+
+def _discover_domain(args: argparse.Namespace) -> str:
+    """The whitespace-normalized discovery domain; empty = global trending."""
+    return " ".join(str(args.discover or "").split())
+
+
+def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
+    domain = _discover_domain(args)
+    # Empty domain = global trending: sweep every river feed's hot list with no
+    # keyword gate. The confidence floor is what keeps junk out, not a keyword.
+    # (--as-of and HTML rejection live in _main's shared --discover dispatch,
+    # so every leg - one-shot or protocol - applies the same guards.)
+    if args.synthesis_file:
+        sys.stderr.write("[last30days] Warning: --synthesis-file is not used by discovery mode.\n")
+
+    boundary = _resolve_discovery_source_boundary(args, config)
+    if boundary is None:
+        return 2
+    requested_sources, enrich_requested_sources = boundary
+    subreddits = _discover_subreddits(args)
+    depth = "deep" if args.deep else "quick" if args.quick else "default"
+    try:
+        report = pipeline.run_discover(
+            domain=domain,
+            config=config,
+            depth=depth,
+            requested_sources=requested_sources,
+            mock=args.mock,
+            subreddits=subreddits,
+            lookback_days=args.lookback_days or 30,
+            as_of_date=args.as_of_date,
+            enrich=not args.discover_shallow,
+            enrich_requested_sources=enrich_requested_sources,
+        )
+    except ValueError as exc:
+        sys.stderr.write(f"[last30days] {exc}\n")
+        return 2
+
+    # Persistent topic queue: annotate this report from prior surfacings, then
+    # record this run's surfacings - BEFORE rendering/export so the Pipeline
+    # line and the JSON queue fields see the annotations. Mock runs stay 100%
+    # side-effect-free.
+    if not args.mock:
+        report = _record_discovery_queue_safely(report, args, config)
+
+    _emit_and_save_discovery_report(report, args, domain)
+    return _discovery_strict_exit_code(report.source_status, config)
+
+
+def _discover_handoff_state_dir(args: argparse.Namespace) -> Path | None:
+    """One resolver for every protocol leg's handoff files: the save dir when
+    given (mirroring _scoped_store_db's scoping), else the config dir - the
+    same base _last_report_cache_path uses. args.save_dir is read AFTER the
+    LAST30DAYS_MEMORY_DIR fallback in _main resolved it."""
+    return discovery_handoff.handoff_state_dir(
+        getattr(args, "save_dir", None), env.CONFIG_DIR
+    )
+
+
+def _run_discover_nominate(args: argparse.Namespace, config: dict[str, object]) -> int:
+    """Protocol leg 1: sweep the listings, build the full judge pool, write
+    the nominations bundle, and print the host-facing judging digest.
+
+    No stage-1 judge, enrichment, confidence floor, or queue writes happen on
+    this leg - the host judges from the bundle and leg 2 (--judgments)
+    resumes from it. A zero-nomination sweep short-circuits to the existing
+    nothing-solid brief with NO bundle written: there is nothing to judge.
+    Writing a fresh bundle starts a NEW protocol round, so any pending
+    report left by a prior round is deleted alongside it.
+    """
+    domain = _discover_domain(args)
+    boundary = _resolve_discovery_source_boundary(args, config)
+    if boundary is None:
+        return 2
+    requested_sources, enrich_requested_sources = boundary
+    lookback_days = args.lookback_days or 30
+    try:
+        result = pipeline.run_discover_nominate(
+            domain=domain,
+            config=config,
+            depth="deep" if args.deep else "quick" if args.quick else "default",
+            requested_sources=requested_sources,
+            mock=args.mock,
+            subreddits=_discover_subreddits(args),
+            lookback_days=lookback_days,
+            as_of_date=args.as_of_date,
+        )
+    except ValueError as exc:
+        sys.stderr.write(f"[last30days] {exc}\n")
+        return 2
+
+    if not result.pool:
+        print(render.render_discovery(pipeline.nominate_nothing_solid_report(result)))
+        return _discovery_strict_exit_code(result.source_status, config)
+
+    entries = [
+        discovery_handoff.PoolEntry(
+            nomination=nomination,
+            cluster_id=cluster_id,
+            # No provider runs on this leg, so the nomination's name and junk
+            # flag ARE the topic_shape heuristics - stored on the row as
+            # leg 2's fallback for anything the host leaves unjudged.
+            heuristic_name=nomination.name,
+            heuristic_junk=nomination.junk_shape,
+        )
+        for nomination, cluster_id in result.pool
+    ]
+    bundle = discovery_handoff.write_nominations_bundle(
+        entries,
+        domain=result.plan.domain,
+        tier="shallow" if args.discover_shallow else "deep",
+        from_date=result.from_date,
+        to_date=result.to_date,
+        lookback_days=lookback_days,
+        enrichment_source_boundary=enrich_requested_sources,
+        requested_sources=requested_sources,
+        # The sweep's finalized per-source outcomes ride the bundle so legs
+        # 2-3 report degraded coverage instead of silently reading clean; the
+        # mock stamp keeps mock-born and real state from cross-finalizing.
+        source_status=result.source_status,
+        mock=args.mock,
+        # Same resolution as _discover_handoff_state_dir: save dir when
+        # given, else the config dir.
+        save_dir=getattr(args, "save_dir", None),
+        config_dir=env.CONFIG_DIR,
+    )
+    # A fresh bundle starts a NEW protocol round: a pending report left by a
+    # prior round is cross-round state a bare --finalize could silently
+    # consume - delete it (missing file is a no-op).
+    state_dir = _discover_handoff_state_dir(args)
+    if state_dir is not None:
+        discovery_handoff.pending_report_path(state_dir).unlink(missing_ok=True)
+    print(discovery_handoff.build_host_digest(bundle))
+    print(
+        "\nJudgments file schema (leg 2): "
+        f'{{"bundle_id": "{bundle.bundle_id}", "judgments": '
+        '[{"id": "n1", "name": "<short topic name>", "junk": false, '
+        '"worthiness": 0-100}, ...]}. '
+        "Then resume with: --discover --judgments <path>."
+    )
+    return _discovery_strict_exit_code(result.source_status, config)
+
+
+def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) -> int:
+    """Protocol leg 2: resume from the nominations bundle, apply the host
+    judgments file, run the deep per-topic research pass, and persist the
+    ranked result as the pending report for leg 3 (--finalize).
+
+    Contract failures (missing/stale bundle, judgments not bound to it, a
+    bundle whose mock provenance disagrees with this run's --mock flag, an
+    unwritable pending-report path) raise HandoffContractError and map to
+    exit 2 in _run_discover_protocol_leg. Zero floor survivors renders the
+    nothing-solid brief right here (clearing any stale prior-round pending
+    file): no pending file, no leg 3. No queue writes and no artifact saves
+    happen on this leg - the topic queue and the rendered brief belong to
+    leg 3.
+    """
+    save_dir = getattr(args, "save_dir", None)
+    bundle = discovery_handoff.read_nominations_bundle(
+        save_dir=save_dir, config_dir=env.CONFIG_DIR,
+    )
+    _require_discover_mock_parity(
+        bundle.mock, args.mock,
+        label="Nominations bundle", path=bundle.path,
+    )
+    judgments = discovery_handoff.read_judgments(
+        args.judgments, bundle, save_dir=save_dir, config_dir=env.CONFIG_DIR,
+    )
+    result = pipeline.run_discover_resume(
+        bundle, judgments, config=config, mock=args.mock,
+    )
+    report = result.report
+
+    if not report.topics:
+        # Nothing cleared the floor: the honest brief ends the protocol here.
+        # This round wrote no pending file, so a stale one from an earlier
+        # round must not survive to feed a bare --finalize (missing file is
+        # a no-op).
+        state_dir = _discover_handoff_state_dir(args)
+        if state_dir is not None:
+            discovery_handoff.pending_report_path(state_dir).unlink(missing_ok=True)
+        print(render.render_discovery(report))
+        return _discovery_strict_exit_code(report.source_status, config)
+
+    state_dir = _discover_handoff_state_dir(args)
+    if state_dir is None:
+        # Unreachable in practice - reading the bundle above required one of
+        # these locations - but kept as a loud contract error, not an assert.
+        raise discovery_handoff.HandoffContractError(
+            "No handoff location available to write the pending report: "
+            "pass --save-dir or configure ~/.config/last30days/."
+        )
+    pending_path = discovery_handoff.pending_report_path(state_dir)
+    payload = {
+        "kind": schema.DISCOVERY_PENDING_KIND,
+        "schema_version": schema.DISCOVERY_PENDING_SCHEMA_VERSION,
+        "bundle_id": bundle.bundle_id,
+        # Fresh TTL clock: leg 3 measures staleness from THIS resume run,
+        # not from the leg-1 sweep.
+        "generated_at": report.generated_at,
+        # Same run_ref format the queue records (leg 3 replays it verbatim).
+        "run_ref": f"discover:{report.domain or 'trending'}:{report.generated_at}",
+        # Leg-2 provenance: leg 3 refuses to finalize across the mock/real
+        # boundary in either direction.
+        "mock": bool(args.mock),
+        # Full schema round-trip (the _write_last_run precedent): leg 3
+        # rebuilds the report from this dict instead of re-running anything.
+        "report": schema.to_dict(report),
+        "angle_inputs": result.angle_inputs,
+    }
+    # ONE post-loop write from the main thread; enrichment workers are daemon
+    # threads and never touch disk.
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        pending_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        # A locked/read-only/full disk is the protocol's clean exit-2 path,
+        # never a traceback (same contract as the bundle write).
+        raise discovery_handoff.HandoffContractError(
+            f"Could not write pending discovery report {pending_path}: {exc}"
+        ) from exc
+
+    print(
+        f"Judged discovery resume: {len(report.topics)} topic"
+        f"{'s' if len(report.topics) != 1 else ''} cleared the floor "
+        f"(bundle_id {bundle.bundle_id})."
+    )
+    print(f"Pending report: {pending_path}")
+    print("\nAngle inputs by nomination id:")
+    print(json.dumps(result.angle_inputs, indent=2))
+    print(
+        "\nWrite the angles file (leg 3): "
+        f'{{"bundle_id": "{bundle.bundle_id}", "angles": '
+        '[{"id": "n1", "podcast": "<one-sentence hook>", '
+        '"x_article": "<one-sentence hook>"}, ...]} - one row per topic id '
+        "above.\n"
+        "Then finalize with: --discover --finalize --angles <path>."
+    )
+    return _discovery_strict_exit_code(report.source_status, config)
+
+
+def _run_discover_finalize(args: argparse.Namespace, config: dict[str, object]) -> int:
+    """Protocol leg 3: load the leg-2 pending report, apply host angles,
+    render the final brief, save discovery artifacts, and record the topic
+    queue. The cheap offline leg - no sweep, no enrichment, no providers,
+    no network; everything renders from the pending report. (HTML/--as-of
+    rejection lives in _main's shared --discover dispatch.)
+
+    Contract failures (missing/stale/mismatched pending report or angles)
+    raise HandoffContractError and map to exit 2 in
+    _run_discover_protocol_leg. The pending file is deliberately LEFT IN
+    PLACE on success: a finalize retry with a corrected angles file must
+    keep working within the TTL, and the queue records under the pending
+    report's leg-2 run_ref, so retries never double-count a surfacing.
+    Mock finalize renders identically but writes no queue rows.
+    """
+    import dataclasses
+
+    save_dir = getattr(args, "save_dir", None)
+    pending = discovery_handoff.read_pending_report(
+        save_dir=save_dir, config_dir=env.CONFIG_DIR,
+    )
+    _require_discover_mock_parity(
+        pending.mock, args.mock,
+        label="Pending discovery report", path=pending.path,
+    )
+    angles = discovery_handoff.read_angles(
+        args.angles, pending, save_dir=save_dir, config_dir=env.CONFIG_DIR,
+    )
+    try:
+        report = schema.discovery_report_from_dict(pending.report)
+    except (KeyError, TypeError, ValueError) as exc:
+        # The envelope validated but the report body is structurally
+        # incomplete: a contract failure with the resume remedy, never a
+        # traceback out of the finalize leg.
+        raise discovery_handoff.HandoffContractError(
+            f"Pending discovery report {pending.path} carries a malformed "
+            f"report body ({type(exc).__name__}: {exc}). "
+            f"{discovery_handoff._RESUME_REMEDY}"
+        ) from exc
+
+    if angles:
+        # Host angles are keyed by nomination id; the pending report's
+        # angle_inputs mapping carries each surviving id's applied topic
+        # name, which is how angles land on the right DiscoveryTopic.
+        angles_by_name = {
+            name: host
+            for nomination_id, host in angles.items()
+            if (name := (pending.angle_inputs.get(nomination_id) or {}).get("name"))
+        }
+        report = dataclasses.replace(report, topics=[
+            dataclasses.replace(
+                topic,
+                podcast_angle=host.podcast,
+                x_article_angle=host.x_article,
+            )
+            if (host := angles_by_name.get(topic.name)) is not None
+            else topic
+            for topic in report.topics
+        ])
+
+    # Persistent topic queue: the protocol's ONE queue write happens here,
+    # under the leg-2 run identity (pending.run_ref) so finalize retries are
+    # idempotent. Mock runs stay 100% side-effect-free.
+    if not args.mock:
+        report = _record_discovery_queue_safely(
+            report, args, config, run_ref=pending.run_ref or None,
+        )
+
+    _emit_and_save_discovery_report(report, args, report.domain)
+    return _discovery_strict_exit_code(report.source_status, config)
+
+
+def _run_discover_protocol_leg(
+    args: argparse.Namespace, config: dict[str, object]
+) -> int:
+    """Route one validated protocol invocation to its leg. Contract failures
+    (unreadable/stale/mismatched handoff files) map to stderr + exit 2 here,
+    so the leg bodies (U3-U5) raise HandoffContractError freely."""
+    try:
+        if args.nominate_only:
+            return _run_discover_nominate(args, config)
+        # --judgments dispatch keys on flag presence (is not None), matching
+        # the --discover convention: never on the path string's truthiness.
+        if args.judgments is not None:
+            return _run_discover_resume(args, config)
+        return _run_discover_finalize(args, config)
+    except discovery_handoff.HandoffContractError as exc:
+        sys.stderr.write(f"[last30days] {exc.message}\n")
+        return 2
 
 
 _STRICT_EXIT_OK_STATES = {"ok", "no-results", "skipped-unconfigured"}
@@ -1506,6 +2280,32 @@ def _render_save_and_print(
         sys.stderr.flush()
     if args.save_dir:
         # Save the main topic's raw file (single-entity or comparison main).
+        # Bind the render to the path save_output actually allocates so the
+        # saved report and stdout agree even when collision fallback is used.
+        def _render_with_actual_path(actual_path: Path) -> str:
+            nonlocal rendered
+            display = compute_output_path_display(str(actual_path))
+            if entity_reports:
+                rendered = emit_comparison_output(
+                    entity_reports,
+                    args.emit,
+                    fun_level=fun_level,
+                    save_path=display,
+                    synthesis_md=synthesis_md,
+                    json_profile=args.json_profile,
+                )
+            else:
+                rendered = emit_output(
+                    report,
+                    args.emit,
+                    fun_level=fun_level,
+                    save_path=display,
+                    synthesis_md=synthesis_md,
+                    json_profile=args.json_profile,
+                    register=audience.name,
+                )
+            return rendered
+
         save_path = save_output(
             report,
             args.emit,
@@ -1513,10 +2313,10 @@ def _render_save_and_print(
             suffix=args.save_suffix or "",
             synthesis_md=synthesis_md,
             topic_override=comparison_topic(entity_reports) if is_comparison_html else None,
-            rendered_content=rendered if is_comparison_html else None,
             json_profile=args.json_profile,
             register=audience.name,
             private=private_saved_format,
+            render_fn=_render_with_actual_path,
         )
         if args.emit == "html":
             publish_companion_paths.append(save_path)
@@ -1603,7 +2403,7 @@ def _propagate_config_to_environ(config: dict[str, object]) -> None:
     XAI_BASE_URL overrides are silently ignored. This is a no-op for
     keys that are already set in process env.
     """
-    for key in ("OPENAI_BASE_URL", "XAI_BASE_URL"):
+    for key in ("OPENAI_BASE_URL", "XAI_BASE_URL", "OPENROUTER_BASE_URL"):
         val = config.get(key)
         if val and not os.environ.get(key):
             os.environ[key] = val
@@ -1638,6 +2438,8 @@ SKILL_ONLY_FLAGS = {
 DOCTOR_PASSTHROUGH_FLAGS = {
     "--json",
     "--cached",
+    "--postmortem",
+    "--probe",
 }
 
 
@@ -1683,12 +2485,19 @@ def _config_policy_for_args(args: argparse.Namespace, topic: str, extra_argv: li
         or normalized_topic == "library search"
         or normalized_topic.startswith("library search ")
     )
+    # Queue commands are local SQLite reads/writes: like library commands they
+    # must never trigger browser-cookie extraction or Keychain prompts.
+    is_queue_command = (
+        normalized_topic == "queue list"
+        or normalized_topic == "queue cover"
+        or normalized_topic.startswith("queue cover ")
+    )
     is_cached_verification = bool(getattr(args, "verify_freshness", None)) and not normalized_topic
     if args.no_browser_cookies:
         browser_mode = "off"
     elif (
         args.diagnose or args.preflight or normalized_topic == "doctor"
-        or is_library_command or is_cached_verification
+        or is_library_command or is_queue_command or is_cached_verification
     ):
         # doctor is plan-only like --diagnose: it must never read cookies.
         # Cache-only freshness verification hits only point APIs (Polymarket,
@@ -2024,12 +2833,19 @@ def _main(
             config,
             emit_json=(args.emit == "json" or "--json" in extra_argv),
             cached="--cached" in extra_argv,
+            postmortem="--postmortem" in extra_argv,
+            probe="--probe" in extra_argv,
         )
 
     if topic.lower() == "library feed":
         return _run_library_feed(args, config)
     if topic.lower() == "library search" or topic.lower().startswith("library search "):
         return _run_library_search(args, config, topic[len("library search") :].strip())
+
+    if topic.lower() == "queue list":
+        return _run_queue_list(args, config)
+    if topic.lower() == "queue cover" or topic.lower().startswith("queue cover "):
+        return _run_queue_cover(args, config, topic[len("queue cover") :].strip())
 
     # Handle setup subcommand
     if topic.lower() == "setup":
@@ -2103,6 +2919,54 @@ def _main(
         if args.drill:
             sys.stderr.write("[last30days] --discover and --drill are mutually exclusive.\n")
             return 2
+        # Shared guards for EVERY discover invocation - the one-shot and all
+        # three protocol legs - hoisted here so no leg can drift: discovery
+        # sweeps live listings (never --as-of) and has no HTML pipeline yet.
+        if args.as_of_date:
+            sys.stderr.write(
+                "[last30days] --as-of cannot be used with --discover because discovery "
+                "sweeps current live listings.\n"
+            )
+            return 2
+        if args.emit == "html" or args.publish_html:
+            sys.stderr.write("[last30days] discovery mode does not support HTML publishing yet.\n")
+            return 2
+        # The three protocol legs are one-leg-per-invocation: each pairing
+        # below asks for two legs at once, so name the combination and stop.
+        # (--judgments/--angles dispatch on presence, never path truthiness.)
+        for first, second, conflict in (
+            ("--nominate-only", "--judgments", args.nominate_only and args.judgments is not None),
+            ("--nominate-only", "--finalize", args.nominate_only and args.finalize),
+            ("--judgments", "--finalize", args.judgments is not None and args.finalize),
+        ):
+            if conflict:
+                sys.stderr.write(
+                    f"[last30days] {first} and {second} are mutually exclusive: "
+                    "each runs a different leg of the discovery protocol.\n"
+                )
+                return 2
+        if args.angles is not None and not args.finalize:
+            sys.stderr.write(
+                "[last30days] --angles only applies to --discover --finalize "
+                "runs; add --finalize or drop the flag.\n"
+            )
+            return 2
+        protocol_leg = (
+            args.nominate_only or args.judgments is not None or args.finalize
+        )
+        if protocol_leg and args.mock and not args.save_dir:
+            # Truthiness is right here: an empty --save-dir/env value means
+            # "no save dir", and handoff state would land in the real config
+            # dir - a side effect mock runs must never have.
+            sys.stderr.write(
+                "[last30days] mock protocol legs require --save-dir to stay "
+                "side-effect-free: --mock with --nominate-only/--judgments/"
+                "--finalize would otherwise write handoff state into the real "
+                "config dir.\n"
+            )
+            return 2
+        if protocol_leg:
+            return _run_discover_protocol_leg(args, config)
         return _run_discover(args, config)
 
     if args.discover_shallow:
@@ -2111,6 +2975,26 @@ def _main(
         sys.stderr.write(
             "[last30days] --discover-shallow only applies to --discover runs; "
             "add --discover [domain] or drop the flag.\n"
+        )
+        return 2
+
+    # Same orphan rule for every protocol-leg flag: without --discover each
+    # would silently no-op into a normal research run.
+    for flag_label, present in (
+        ("--nominate-only", args.nominate_only),
+        ("--judgments", args.judgments is not None),
+        ("--finalize", args.finalize),
+    ):
+        if present:
+            sys.stderr.write(
+                f"[last30days] {flag_label} only applies to --discover runs; "
+                "add --discover [domain] or drop the flag.\n"
+            )
+            return 2
+    if args.angles is not None:
+        sys.stderr.write(
+            "[last30days] --angles only applies to --discover --finalize runs; "
+            "add --discover --finalize or drop the flag.\n"
         )
         return 2
 
@@ -2209,6 +3093,18 @@ def _main(
         return hosted.run_hosted(topic, depth, **hosted_kwargs)
 
     requested_sources = resolve_requested_sources(args.search, config)
+    # Explicit --trustpilot-domain is user intent: activate the opt-in source
+    # before diagnose/run so the flag cannot silently no-op (#873). Auto-resolve
+    # hints are applied later and must not call this path.
+    cli_trustpilot_domain = (
+        args.trustpilot_domain.strip() if args.trustpilot_domain else ""
+    )
+    if cli_trustpilot_domain:
+        requested_sources = activate_trustpilot_for_explicit_domain(
+            config,
+            requested_sources,
+            reason=f"--trustpilot-domain={cli_trustpilot_domain}",
+        )
     diag = pipeline.diagnose(config, requested_sources, safe=args.diagnose)
 
     if args.diagnose:
@@ -2271,6 +3167,15 @@ def _main(
     progress.start_processing()
 
     depth = "deep" if args.deep else "quick" if args.quick else "default"
+    # CLI overrides for the depth profile's result caps (issue #716). Stashed on
+    # config so pipeline.run() can apply them without widening its signature; the
+    # comparison path inherits them via `entity_config = dict(config)`.
+    if args.max_results is not None:
+        config["_max_results"] = args.max_results
+    if args.max_per_source is not None:
+        config["_max_per_source"] = args.max_per_source
+    if args.max_source_fetches is not None:
+        config["_max_source_fetches"] = args.max_source_fetches
     try:
         x_related = [h.strip() for h in args.x_related.split(",") if h.strip()] if args.x_related else None
         subreddits = [s.strip().removeprefix("r/") for s in args.subreddits.split(",") if s.strip()] if args.subreddits else None
@@ -2297,6 +3202,12 @@ def _main(
                 # Fail fast instead of silently dropping to the internal planner
                 # and burning a paid run the user did not ask for. Mirrors the
                 # --plan file-read branch above and parse_competitors_plan.
+                raise SystemExit(2)
+            from lib import planner as _plan_validator
+            try:
+                _plan_validator.validate_external_plan(external_plan)
+            except ValueError as exc:
+                sys.stderr.write(f"[Planner] Invalid --plan schema: {exc}.\n")
                 raise SystemExit(2)
 
         # Auto-resolve: use web search to discover subreddits/handles before planning.
@@ -2340,6 +3251,18 @@ def _main(
         github_repos = [r.strip() for r in args.github_repo.split(",") if r.strip() and "/" in r.strip()] if args.github_repo else None
         trustpilot_domain = args.trustpilot_domain.strip() if args.trustpilot_domain else None
 
+        comp_enabled, comp_count, comp_explicit = resolve_competitors_args(args)
+        comp_plan = parse_competitors_plan(args.competitors_plan)
+
+        # Plan-level trustpilot_domain pins are the same user intent as the CLI
+        # flag (already activated above). Auto-resolve hints must not activate.
+        if plan_has_explicit_trustpilot_domain(comp_plan):
+            requested_sources = activate_trustpilot_for_explicit_domain(
+                config,
+                requested_sources,
+                reason="competitors-plan trustpilot_domain",
+            )
+
         # Only canonicalize when repos came from a user-supplied --github-repo flag.
         # When repos_from_auto_resolve is True, auto_resolve already ran
         # canonicalize_github_repos(cap=5) and ranked by relevance; re-running here
@@ -2365,9 +3288,6 @@ def _main(
             if "perplexity" not in include.lower():
                 config["INCLUDE_SOURCES"] = f"{include},perplexity" if include else "perplexity"
 
-        comp_enabled, comp_count, comp_explicit = resolve_competitors_args(args)
-        comp_plan = parse_competitors_plan(args.competitors_plan)
-
         # Polymarket disambiguation: if user passed --polymarket-keywords,
         # store on config so the polymarket adapter can filter matches.
         if args.polymarket_keywords:
@@ -2379,23 +3299,31 @@ def _main(
             if keywords:
                 config["_polymarket_keywords"] = keywords
 
-        # vs-mode: if the topic string contains " vs " / " versus " and the
-        # planner can split it into >=2 entities, route through the same
-        # N-pass fanout path as --competitors. The first entity becomes the
-        # main topic; remaining entities become the competitor list. User's
-        # outer --x-handle / --subreddits apply to the first entity unless
-        # --competitors-plan covers it.
-        from lib import planner as _planner
-        vs_entities = _planner._comparison_entities(topic)
-        if len(vs_entities) >= 2 and not comp_enabled:
-            topic = vs_entities[0]
-            comp_enabled = True
-            comp_count = len(vs_entities) - 1
-            comp_explicit = vs_entities[1:]
+        # vs-mode / plan routing: split a vs-topic into main + peers unless
+        # discover-N or an explicit --competitors-list already decided who runs.
+        topic, comp_enabled, comp_count, comp_explicit = apply_vs_competitor_routing(
+            topic,
+            competitors_flag=args.competitors,
+            comp_enabled=comp_enabled,
+            comp_count=comp_count,
+            comp_explicit=comp_explicit,
+            comp_plan=comp_plan,
+        )
+
+        # Plan alone with zero peers (empty/invalid JSON object, or all entries
+        # skipped) must not fall through to discover-N with a misleading abort.
+        if (
+            comp_enabled
+            and not comp_explicit
+            and args.competitors is None
+            and args.competitors_plan
+        ):
             sys.stderr.write(
-                f"[Competitors] vs-mode: routing to N-pass fanout: "
-                f"{' vs '.join(vs_entities)}\n"
+                "[Competitors] --competitors-plan has no usable peer entries "
+                "(and the topic is not a vs-comparison). Pass a non-empty plan, "
+                "a vs-topic, --competitors-list, or --competitors N.\n"
             )
+            return 2
 
         # Dedicated subs ride the config dict (already threaded to every source
         # fetch) so the keyless Reddit path can pull them floor-exempt without

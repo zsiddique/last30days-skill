@@ -7,7 +7,7 @@ import math
 import re
 from datetime import datetime
 
-from . import http, providers, query, schema, signals
+from . import http, providers, relevance, schema, signals
 
 
 # Penalty applied when a candidate does not mention the primary entity
@@ -18,6 +18,14 @@ from . import http, providers, query, schema, signals
 # Nate Herk "Managed Agents" video scored 51 / ranked #2 with zero
 # Hermes content.
 ENTITY_MISS_PENALTY = 25.0
+
+# A fallback entity miss is hidden from synthesized evidence only when it also
+# lacks every stable raw-topic anchor. Explicitly scoped sources such as GitHub
+# project mode carry a high local-relevance floor and therefore escape this
+# visibility gate even when their short title omits the user's wording.
+FALLBACK_ENTITY_MISS_CONFIDENCE_ESCAPE = 0.5
+FALLBACK_ENTITY_MISS_TOPIC_ESCAPE = 0.25
+_FALLBACK_ENTITY_MISS_EXPLANATION = "fallback-local-score (entity-miss demotion)"
 
 # Small additive credit for a post authored by one of the run's resolved
 # handles (see rerank_candidates / _fallback_tuple). Deliberately small: the
@@ -94,6 +102,14 @@ def discovery_velocity_score(
 #   (>= FLOOR_MIN_SOURCES) OR a genuinely strong single-source spike
 #   (>= FLOOR_SINGLE_SOURCE_ENGAGEMENT) - a 1,600-point single-source HN
 #   thread is a real story, a 30-upvote single-source meme is not.
+# - Junk-shaped topics (help-me/beginner/musing shapes flagged by the stage-1
+#   judge or the topic_shape heuristics) get a stricter read: the
+#   single-source engagement bypass is OFF (a 226-comment "help me choose"
+#   thread is a busy support thread, not a story), and their
+#   FLOOR_MIN_SOURCES corroboration is counted against SEED listing sources
+#   when the caller provides that count - a successful enrichment pass pulls
+#   a multi-source corpus for almost any topic, so an enriched-count check
+#   would never bind.
 FLOOR_MIN_ENGAGEMENT = 25.0
 FLOOR_MIN_SOURCES = 2
 FLOOR_SINGLE_SOURCE_ENGAGEMENT = 200.0
@@ -104,17 +120,49 @@ def passes_discovery_floor(
     source_count: int,
     engagement_total: float,
     item_count: int,
+    junk_shape: bool = False,
+    seed_source_count: int | None = None,
 ) -> bool:
     """Whether a discovery topic's evidence is strong enough to show a user.
 
     Below this floor the honest output is "nothing solid this window", not a
     ranked list of whatever survived the sweep.
+
+    ``junk_shape=True`` removes the single-source engagement bypass and
+    evaluates the corroboration requirement against ``seed_source_count``
+    (distinct SEED listing sources) when provided, falling back to
+    ``source_count`` otherwise. Non-junk topics are unaffected by both
+    parameters.
     """
     if item_count <= 0 or engagement_total < FLOOR_MIN_ENGAGEMENT:
         return False
+    if junk_shape:
+        corroboration = seed_source_count if seed_source_count is not None else source_count
+        return corroboration >= FLOOR_MIN_SOURCES
     if source_count >= FLOOR_MIN_SOURCES:
         return True
     return engagement_total >= FLOOR_SINGLE_SOURCE_ENGAGEMENT
+
+
+# Stage-1 discovery judge (nominate stage). The top JUDGE_POOL_LIMIT clusters
+# by velocity get ONE batched LLM verdict each (short searchable name, junk
+# flag, 0-100 content-worthiness); clusters beyond the pool keep heuristic
+# names and their velocity-only score. Worthiness blends into the ranking
+# score as
+#   blended = velocity * (JUDGE_BLEND_BASE + worthiness / 100)
+# so velocity stays dominant (the multiplier spans 0.5x-1.5x) but a quiet,
+# highly content-worthy cluster can overtake a viral junk one. A missing
+# worthiness (heuristic fallback, judge skipped a row) is neutral at 50 -
+# the multiplier is exactly 1.0, i.e. the plain velocity score.
+JUDGE_POOL_LIMIT = 15
+JUDGE_BLEND_BASE = 0.5
+
+
+def judge_blended_score(velocity: float, worthiness: float | None) -> float:
+    """Velocity-dominant, worthiness-weighted ranking score (constants above)."""
+    effective = 50.0 if worthiness is None else max(0.0, min(100.0, worthiness))
+    return velocity * (JUDGE_BLEND_BASE + effective / 100.0)
+
 
 # Engagement rescue: a high-engagement X post that is on-topic (entity-grounded
 # or first-party) cannot be fully zeroed by the other penalties. The floor is a
@@ -622,6 +670,54 @@ def _primary_entity(topic: str) -> str:
     return stripped
 
 
+def _is_corpus_candidate(candidate: schema.Candidate) -> bool:
+    """True when the candidate carries private corpus evidence."""
+    if candidate.source == "corpus":
+        return True
+    return any(item.source == "corpus" for item in candidate.source_items)
+
+
+def prune_fallback_entity_misses(
+    candidates: list[schema.Candidate],
+    *,
+    topic: str,
+) -> list[schema.Candidate]:
+    """Hide unanchored, low-confidence fallback misses from visible evidence.
+
+    Broad recommendation queries can be misread as one long primary entity,
+    causing every fallback candidate to receive the entity-miss marker. The
+    marker alone is therefore not a safe filter. A candidate is removed only
+    when its stable title and snippet do not clear a meaningful raw-topic
+    relevance floor and it lacks a strong local-relevance signal from an
+    explicitly scoped retrieval path. Comments and transcripts are excluded
+    from this escape because incidental words there do not ground the candidate
+    itself. Private corpus candidates always escape: retrieval already accepted
+    them on body text, and titles are often filenames that omit the head token.
+    Source items remain in the report's diagnostic source dump.
+    """
+    if not topic:
+        return candidates
+
+    kept: list[schema.Candidate] = []
+    for candidate in candidates:
+        if candidate.explanation != _FALLBACK_ENTITY_MISS_EXPLANATION:
+            kept.append(candidate)
+            continue
+        if _is_corpus_candidate(candidate):
+            kept.append(candidate)
+            continue
+        if candidate.local_relevance >= FALLBACK_ENTITY_MISS_CONFIDENCE_ESCAPE:
+            kept.append(candidate)
+            continue
+        primary_text = f"{candidate.title or ''} {candidate.snippet or ''}"
+        if (
+            relevance.token_overlap_relevance(topic, primary_text)
+            >= FALLBACK_ENTITY_MISS_TOPIC_ESCAPE
+        ):
+            kept.append(candidate)
+    return kept
+
+
 #: Secondary entity-miss penalty applied directly to final_score (not just
 #: rerank_score). The -25 on rerank_score composes to only -15 on final_score
 #: via the 0.60 weight, which engagement bonus partially offsets on
@@ -657,8 +753,6 @@ def _final_score(candidate: schema.Candidate) -> float:
     if candidate.explanation and "entity-miss" in candidate.explanation:
         base = max(0.0, base - ENTITY_MISS_FINAL_PENALTY)
     return base
-
-
 
 
 def score_fun(

@@ -60,7 +60,7 @@ KEYCHAIN_KEYS = (
     "AUTH_TOKEN", "CT0", "BSKY_HANDLE", "BSKY_APP_PASSWORD",
     "TRUTHSOCIAL_TOKEN", "BRAVE_API_KEY", "EXA_API_KEY", "SERPER_API_KEY",
     "OPENROUTER_API_KEY", "PERPLEXITY_API_KEY", "PARALLEL_API_KEY", "XQUIK_API_KEY",
-    "XIAOHONGSHU_API_BASE",
+    "XIAOHONGSHU_API_BASE", "GITHUB_TOKEN",
 )
 
 # pass(1) integration: Linux/Unix analog of the Keychain source. Each key in
@@ -457,6 +457,9 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
     }
 
     keys = [
+        # Debug flag; also exported to os.environ below so log.py's lazy
+        # os.environ.get() picks up .env values after get_config() runs.
+        ('LAST30DAYS_DEBUG', None),
         ('XAI_API_KEY', None),
         ('GOOGLE_API_KEY', None),
         ('GEMINI_API_KEY', None),
@@ -470,9 +473,20 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_REDDIT_BACKEND', None),
         # Doctor cache freshness window in seconds (doctor --cached).
         ('LAST30DAYS_DOCTOR_TTL', None),
+        # Per-source deadline (seconds) for doctor --probe live checks.
+        ('LAST30DAYS_DOCTOR_PROBE_TIMEOUT', None),
         ('LAST30DAYS_REDDIT_SC_MIN_ITEMS', None),
         ('CRAWL4AI_URL', None),
         ('LAST30DAYS_STORE', None),
+        # Discovery topic queue (podcast/X-article pipeline memory). Default
+        # ON; the literal value "off" disables queue writes and annotations.
+        ('LAST30DAYS_DISCOVERY_QUEUE', None),
+        # Wall-clock budget (seconds) for the deep-tier enrichment batch on
+        # the discovery resume leg (--discover --judgments). Read from the
+        # resolved config only (pipeline._resume_enrich_budget_seconds);
+        # unset/invalid falls back to 450s. The one-shot --discover path
+        # keeps its fixed 240s quick budget regardless.
+        ('LAST30DAYS_ENRICH_BUDGET_SECONDS', None),
         # Opt-in strict exit: truthy -> CLI exits 3 when any source outcome is
         # degraded (neither ok, no-results, nor skipped-unconfigured). #384.
         ('LAST30DAYS_STRICT_EXIT', None),
@@ -490,6 +504,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('XAI_MODEL_PIN', None),
         ('OPENAI_BASE_URL', None),
         ('XAI_BASE_URL', None),
+        ('OPENROUTER_BASE_URL', None),
         ('SCRAPECREATORS_API_KEY', None),
         ('APIFY_API_TOKEN', None),
         ('AUTH_TOKEN', None),
@@ -543,16 +558,36 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_REPORT_CACHE_TTL_SECONDS', None),
         ('LAST30DAYS_VERIFY_FRESHNESS', None),
         ('LAST30DAYS_TRANSCRIPT_TIMEOUT', None),
+        ('DEGRADED_TRANSCRIPT_THRESHOLD', None),
         (KEYCHAIN_ALIASES_ENV, None),
         # Whisper transcription provider for caption-free audio/video. Groq's
         # free tier is preferred; OPENAI_API_KEY is the paid backstop (already
         # resolved above via openai_auth).
         ('GROQ_API_KEY', None),
         ('LAST30DAYS_YT_SUB_LANGS', 'en,es,pt'),
+        ('LAST30DAYS_YT_TRANSCRIPT_FAST_TIMEOUT', None),
+        ('LAST30DAYS_YT_SEARCH_TIMEOUT', None),
+        ('GITHUB_TOKEN', None),
     ]
 
     for key, default in keys:
         config[key] = os.environ.get(key) or merged_env.get(key, default)
+
+    # Export debug flag to os.environ so log.py's lazy os.environ.get()
+    # picks up .env values. setdefault ensures a shell-exported value is
+    # never overwritten by the (lower-priority) .env value.
+    if config.get('LAST30DAYS_DEBUG'):
+        os.environ.setdefault('LAST30DAYS_DEBUG', config['LAST30DAYS_DEBUG'])
+
+    # youtube_yt reads these tuning knobs lazily from os.environ, so values
+    # loaded from .env must be exported into the current engine process.
+    for key in (
+        'LAST30DAYS_YT_SUB_LANGS',
+        'LAST30DAYS_YT_TRANSCRIPT_FAST_TIMEOUT',
+        'LAST30DAYS_YT_SEARCH_TIMEOUT',
+    ):
+        if config.get(key):
+            os.environ.setdefault(key, config[key])
 
     # Backward-compat: ScrapeCreators' own examples and tutorials use the
     # SCRAPE_CREATORS_API_KEY spelling (with underscore between SCRAPE and
@@ -875,14 +910,20 @@ def is_ytdlp_available() -> bool:
 def is_youtube_comments_available(config: dict[str, Any]) -> bool:
     """Check if YouTube comment enrichment is available.
 
-    Requires SCRAPECREATORS_API_KEY AND ``youtube_comments`` in
-    ``INCLUDE_SOURCES`` (mirrors ``is_tiktok_comments_available``). Cost is
-    bounded by ``enrich_with_comments(max_videos=3)`` (~3 credits per run).
+    yt-dlp fetches YouTube comments free and keyless, so when it is installed
+    comments need no credential and no ``INCLUDE_SOURCES`` opt-in — the opt-in
+    only ever existed to gate ScrapeCreators credit spend, and there is none to
+    gate. ``EXCLUDE_SOURCES=youtube_comments`` remains the off-switch.
 
-    In the default onboarding tier: the Recommended tier now enables comments
-    (posts on -> comments on for TikTok/Instagram/YouTube), writing
-    ``youtube_comments`` into INCLUDE_SOURCES.
+    Without yt-dlp, the legacy ScrapeCreators path still applies: it requires
+    SCRAPECREATORS_API_KEY AND ``youtube_comments`` in ``INCLUDE_SOURCES``
+    (mirroring ``is_tiktok_comments_available``), bounded by
+    ``enrich_with_comments(max_videos=3)`` at ~3 credits per run.
     """
+    if 'youtube_comments' in _parse_exclude_sources(config):
+        return False
+    if is_ytdlp_available():
+        return True
     if not config.get('SCRAPECREATORS_API_KEY'):
         return False
     return 'youtube_comments' in _parse_include_sources(config)

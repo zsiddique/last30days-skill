@@ -5,6 +5,7 @@ import subprocess
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from lib.bird_x import parse_bird_response
 
@@ -505,6 +506,60 @@ class TestStrongestTokenRetryAnchored(unittest.TestCase):
 
         self.assertTrue(queries)
         self.assertIn("agentcookie", queries[-1])
+
+
+class TestBirdRetryQueryCorrectness(unittest.TestCase):
+    def test_quoted_topic_only_generates_balanced_retry_queries(self):
+        from lib import bird_x
+
+        queries = []
+
+        def fake_run(query, count, timeout):
+            queries.append(query)
+            if len(queries) == 1:
+                return {"items": []}
+            return {"error": "Bird search failed", "items": []}
+
+        with mock.patch.object(
+            bird_x,
+            "_extract_core_subject",
+            return_value='immobilienmakler(berlin "mixed-use',
+        ), mock.patch(
+            "lib.query.extract_compound_terms",
+            return_value=['"immobilienmakler berlin"'],
+        ), mock.patch.object(bird_x, "_run_bird_search", side_effect=fake_run):
+            response = bird_x.search_x(
+                '"Immobilienmakler Berlin" competitors',
+                "2026-07-12",
+                "2026-07-19",
+            )
+
+        self.assertGreaterEqual(len(queries), 2)
+        self.assertEqual(
+            "immobilienmakler berlin mixed-use since:2026-07-12",
+            queries[0],
+        )
+        for query in queries:
+            self.assertEqual(0, query.count('"') % 2, query)
+            self.assertEqual(query.count("("), query.count(")"), query)
+        self.assertNotIn("error", response)
+        self.assertEqual([], response["items"])
+
+    def test_every_failed_attempt_still_reports_backend_failure(self):
+        from lib import bird_x
+
+        with mock.patch.object(
+            bird_x, "_extract_core_subject", return_value="immobilienmakler berlin market"
+        ), mock.patch.object(
+            bird_x,
+            "_run_bird_search",
+            return_value={"error": "Bird search failed", "items": []},
+        ):
+            response = bird_x.search_x(
+                "Immobilienmakler Berlin market", "2026-07-12", "2026-07-19"
+            )
+
+        self.assertEqual("Bird search failed", response["error"])
 
 
 class LeadingMentionsTests(unittest.TestCase):

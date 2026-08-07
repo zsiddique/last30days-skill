@@ -1,3 +1,4 @@
+# fmt: off
 import contextlib
 import json
 import io
@@ -90,6 +91,27 @@ class CliV3Tests(unittest.TestCase):
         self.assertEqual(2, result.returncode, result.stderr)
         self.assertIn("Invalid --plan JSON", result.stderr)
 
+    def test_invalid_plan_structure_exits_nonzero_without_fallback(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "skills/last30days/scripts/last30days.py",
+                "test topic",
+                "--mock",
+                "--emit=json",
+                "--plan",
+                json.dumps({"queries": {"web": ["Berlin"]}}),
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(2, result.returncode, result.stderr)
+        self.assertIn("Invalid --plan schema", result.stderr)
+        self.assertNotIn("fallback-plan", result.stderr)
+
     def test_parse_search_flag_normalizes_aliases_and_dedupes(self):
         self.assertEqual(
             ["grounding", "reddit", "hackernews"],
@@ -164,6 +186,26 @@ class CliV3Tests(unittest.TestCase):
         self.assertEqual(["biosecurity", "ai", "agents"], args.topic)
         self.assertEqual([], extra)
 
+    def test_build_parser_accepts_web_backend_keyless(self):
+        """Regression for #905: CONFIGURATION.md documents --web-backend=keyless
+        to force the zero-key floor, but the choices list rejected it."""
+        parser = cli.build_parser()
+        args, extra = parser.parse_known_args(["--web-backend", "keyless", "biosecurity"])
+        self.assertEqual("keyless", args.web_backend)
+        self.assertEqual([], extra)
+
+    def test_build_parser_still_accepts_other_web_backend_values(self):
+        parser = cli.build_parser()
+        for value in ("auto", "brave", "exa", "serper", "parallel", "none"):
+            args, extra = parser.parse_known_args(["--web-backend", value, "biosecurity"])
+            self.assertEqual(value, args.web_backend)
+            self.assertEqual([], extra)
+
+    def test_build_parser_rejects_invalid_web_backend(self):
+        parser = cli.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_known_args(["--web-backend", "bogus", "biosecurity"])
+
     def test_build_parser_accepts_explicit_output_file(self):
         parser = cli.build_parser()
         args, extra = parser.parse_known_args(
@@ -172,6 +214,25 @@ class CliV3Tests(unittest.TestCase):
         self.assertEqual("results/run.json", args.output)
         self.assertEqual(["biosecurity"], args.topic)
         self.assertEqual([], extra)
+
+    def test_build_parser_accepts_result_cap_overrides(self):
+        parser = cli.build_parser()
+        args, extra = parser.parse_known_args(
+            ["--max-results", "200", "--max-per-source", "60",
+             "--max-source-fetches", "8", "figma config 2026"]
+        )
+        self.assertEqual(200, args.max_results)
+        self.assertEqual(60, args.max_per_source)
+        self.assertEqual(8, args.max_source_fetches)
+        self.assertEqual(["figma config 2026"], args.topic)
+        self.assertEqual([], extra)
+
+    def test_result_cap_overrides_default_to_none(self):
+        parser = cli.build_parser()
+        args, _ = parser.parse_known_args(["figma config 2026"])
+        self.assertIsNone(args.max_results)
+        self.assertIsNone(args.max_per_source)
+        self.assertIsNone(args.max_source_fetches)
 
     def test_research_unknown_flag_fails_before_config_load(self):
         with mock.patch.object(
@@ -304,6 +365,84 @@ class CliV3Tests(unittest.TestCase):
             self.assertEqual("base content", base.read_text(encoding="utf-8"))
             self.assertEqual("dated content", dated.read_text(encoding="utf-8"))
             self.assertTrue(saved.exists())
+
+    def test_save_output_render_fn_footer_names_actual_collision_path(self):
+        from lib import render as render_module
+
+        report = self.make_report()
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = Path(tmp)
+            today = datetime.now().strftime("%Y-%m-%d")
+            base = save_dir / "openclaw-vs-nanoclaw-raw.md"
+            dated = save_dir / f"openclaw-vs-nanoclaw-raw-{today}.md"
+            base.write_text("base content", encoding="utf-8")
+            dated.write_text("dated content", encoding="utf-8")
+
+            def render_fn(actual_path: Path) -> str:
+                return render_module.render_compact(report, save_path=str(actual_path))
+
+            saved = cli.save_output(report, "md", tmp, render_fn=render_fn)
+
+            expected = (save_dir / f"openclaw-vs-nanoclaw-raw-{today}-1.md").resolve()
+            self.assertEqual(expected, saved.resolve())
+            content = saved.read_text(encoding="utf-8")
+            self.assertIn(f"Raw results saved to {saved}", content)
+            self.assertNotIn(f"Raw results saved to {base}", content)
+            self.assertNotIn(f"Raw results saved to {dated}", content)
+            self.assertEqual("base content", base.read_text(encoding="utf-8"))
+            self.assertEqual("dated content", dated.read_text(encoding="utf-8"))
+
+    def test_save_output_removes_reserved_candidate_when_deferred_render_fails(self):
+        report = self.make_report()
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = Path(tmp)
+
+            def fail_render(_actual_path: Path) -> str:
+                raise RuntimeError("render failed")
+
+            with self.assertRaisesRegex(RuntimeError, "render failed"):
+                cli.save_output(report, "md", tmp, render_fn=fail_render)
+
+            self.assertEqual([], list(save_dir.iterdir()))
+
+    def test_render_save_and_print_uses_actual_collision_path_in_file_and_stdout(self):
+        report = self.make_report(topic="Collision Topic")
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = Path(tmp)
+            today = datetime.now().strftime("%Y-%m-%d")
+            base = save_dir / "collision-topic-raw.md"
+            dated = save_dir / f"collision-topic-raw-{today}.md"
+            expected = save_dir / f"collision-topic-raw-{today}-1.md"
+            base.write_text("base content", encoding="utf-8")
+            dated.write_text("dated content", encoding="utf-8")
+            args = types.SimpleNamespace(
+                topic=["Collision Topic"],
+                competitors=None,
+                competitors_list=None,
+                competitors_plan=None,
+                drill=False,
+                register=None,
+                emit="compact",
+                output=None,
+                save_dir=str(save_dir),
+                save_suffix="",
+                json_profile="agent",
+                publish_html=False,
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = cli._render_save_and_print(args, report, None, None, {})
+
+            self.assertEqual(0, rc)
+            expected_display = cli.compute_output_path_display(str(expected))
+            footer = f"Raw results saved to {expected_display}"
+            self.assertTrue(expected.exists())
+            self.assertIn(footer, expected.read_text(encoding="utf-8"))
+            self.assertIn(footer, stdout.getvalue())
+            self.assertEqual("base content", base.read_text(encoding="utf-8"))
+            self.assertEqual("dated content", dated.read_text(encoding="utf-8"))
 
     def test_save_output_writes_utf8_encoded_markdown(self):
         report = self.make_report()
@@ -512,11 +651,15 @@ class CliV3Tests(unittest.TestCase):
 
             self.assertEqual(0, rc)
             output_display = cli.compute_output_path_display(str(output_path))
-            _, kwargs = emit_comparison.call_args
-            self.assertEqual(output_display, kwargs["save_path"])
+            comparison_saved = save_dir / "alpha-vs-beta-raw-html.html"
+            self.assertEqual(2, emit_comparison.call_count)
+            first_kwargs = emit_comparison.call_args_list[0].kwargs
+            second_kwargs = emit_comparison.call_args_list[1].kwargs
+            self.assertEqual(output_display, first_kwargs["save_path"])
+            comparison_display = cli.compute_output_path_display(str(comparison_saved))
+            self.assertEqual(comparison_display, second_kwargs["save_path"])
             self.assertEqual("<html>comparison</html>\n", stdout.getvalue())
             self.assertEqual("<html>comparison</html>", output_path.read_text(encoding="utf-8"))
-            comparison_saved = save_dir / "alpha-vs-beta-raw-html.html"
             self.assertEqual(
                 "<html>comparison</html>",
                 comparison_saved.read_text(encoding="utf-8"),
@@ -616,6 +759,107 @@ class CliV3Tests(unittest.TestCase):
             f"{[c.kwargs.get('trustpilot_domain') for c in run_mock.call_args_list]}",
         )
         self.assertFalse(main_call.kwargs.get("trustpilot_domain_is_hint"))
+
+    def test_trustpilot_domain_auto_activates_include_sources(self):
+        """Explicit --trustpilot-domain must activate Trustpilot even when
+        INCLUDE_SOURCES omits it (#873) — otherwise the flag silently no-ops."""
+        report = self.make_report(topic="Weber grills")
+        diag = {
+            "available_sources": ["tiktok", "instagram"],
+            "providers": {"google": True, "openai": False, "xai": False},
+            "x_backend": None,
+            "bird_installed": True,
+            "bird_authenticated": False,
+            "bird_username": None,
+            "native_web_backend": "brave",
+        }
+        config = {"INCLUDE_SOURCES": "tiktok,instagram"}
+        with mock.patch.object(cli.env, "get_config", return_value=config), \
+             mock.patch.object(cli.pipeline, "diagnose", return_value=diag), \
+             mock.patch.object(cli.pipeline, "run", return_value=report) as run_mock, \
+             mock.patch.object(cli, "emit_output", return_value="# rendered"), \
+             mock.patch.object(sys, "argv", [
+                 "last30days.py",
+                 "Weber grills",
+                 "--trustpilot-domain",
+                 "weber.co.uk",
+             ]):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = cli.main()
+        self.assertEqual(0, rc)
+        self.assertIn("trustpilot", config["INCLUDE_SOURCES"].lower())
+        self.assertIn("[Trustpilot] --trustpilot-domain=weber.co.uk activated", stderr.getvalue())
+        main_call = run_mock.call_args_list[0]
+        self.assertEqual(main_call.kwargs.get("trustpilot_domain"), "weber.co.uk")
+
+    def test_trustpilot_domain_auto_activates_with_search_filter(self):
+        """When --search omits trustpilot, the explicit domain flag must still
+        append it to requested_sources so the intersection filter cannot drop it."""
+        report = self.make_report(topic="Weber grills")
+        diag = {
+            "available_sources": ["tiktok", "instagram", "trustpilot"],
+            "providers": {"google": True, "openai": False, "xai": False},
+            "x_backend": None,
+            "bird_installed": True,
+            "bird_authenticated": False,
+            "bird_username": None,
+            "native_web_backend": "brave",
+        }
+        config = {"INCLUDE_SOURCES": "tiktok,instagram"}
+        with mock.patch.object(cli.env, "get_config", return_value=config), \
+             mock.patch.object(cli.pipeline, "diagnose", return_value=diag), \
+             mock.patch.object(cli.pipeline, "run", return_value=report) as run_mock, \
+             mock.patch.object(cli, "emit_output", return_value="# rendered"), \
+             mock.patch.object(sys, "argv", [
+                 "last30days.py",
+                 "Weber grills",
+                 "--search",
+                 "tiktok,instagram",
+                 "--trustpilot-domain",
+                 "weber.co.uk",
+             ]):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc = cli.main()
+        self.assertEqual(0, rc)
+        requested = run_mock.call_args_list[0].kwargs.get("requested_sources") or []
+        self.assertIn("trustpilot", requested)
+
+    def test_trustpilot_domain_respects_exclude_sources(self):
+        config = {"INCLUDE_SOURCES": "tiktok", "EXCLUDE_SOURCES": "trustpilot"}
+        requested = cli.activate_trustpilot_for_explicit_domain(
+            config, ["tiktok"], reason="--trustpilot-domain=weber.co.uk",
+        )
+        self.assertEqual(requested, ["tiktok"])
+        self.assertNotIn("trustpilot", config["INCLUDE_SOURCES"].lower())
+
+
+class ActivateTrustpilotHelperTests(unittest.TestCase):
+    def test_plan_has_explicit_trustpilot_domain(self):
+        self.assertTrue(cli.plan_has_explicit_trustpilot_domain({
+            "traeger": {"trustpilot_domain": "traeger.com"},
+        }))
+        self.assertFalse(cli.plan_has_explicit_trustpilot_domain({
+            "traeger": {"x_handle": "Traeger"},
+        }))
+        self.assertFalse(cli.plan_has_explicit_trustpilot_domain(None))
+
+    def test_activate_adds_include_and_requested(self):
+        config = {"INCLUDE_SOURCES": "tiktok,instagram"}
+        requested = cli.activate_trustpilot_for_explicit_domain(
+            config, ["tiktok", "instagram"], reason="--trustpilot-domain=x.com",
+        )
+        self.assertIn("trustpilot", config["INCLUDE_SOURCES"].lower())
+        self.assertEqual(requested, ["tiktok", "instagram", "trustpilot"])
+
+    def test_activate_noop_when_already_present(self):
+        config = {"INCLUDE_SOURCES": "tiktok,trustpilot"}
+        requested = cli.activate_trustpilot_for_explicit_domain(
+            config, ["trustpilot"], reason="--trustpilot-domain=x.com",
+        )
+        self.assertEqual(config["INCLUDE_SOURCES"], "tiktok,trustpilot")
+        self.assertEqual(requested, ["trustpilot"])
 
 
 if __name__ == "__main__":

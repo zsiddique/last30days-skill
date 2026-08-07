@@ -9,11 +9,12 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, quote
 
 from . import health
 from . import log as _log
@@ -433,6 +434,27 @@ def capture_failures():
 
 
 @contextmanager
+def tee_failures():
+    """Observe failures locally WITHOUT hiding them from the enclosing sink.
+
+    ``capture_failures()`` *replaces* the context-local sink, so nesting it
+    inside a retrieval context swallows the very failure the pipeline needs.
+    This yields a local list and forwards its contents to the parent sink on
+    exit, so a swallow site (``get_text`` returns None and drops the status)
+    can recover what it lost while the pipeline still sees the failure.
+    """
+    parent = _failure_sink.get()
+    local: list[HTTPError] = []
+    token = _failure_sink.set(local)
+    try:
+        yield local
+    finally:
+        _failure_sink.reset(token)
+        if parent is not None:
+            parent.extend(local)
+
+
+@contextmanager
 def expected_misses(*status_codes: int):
     """Exclude adapter-declared probe misses from captured run failures."""
     token = _expected_miss_statuses.set(
@@ -444,7 +466,7 @@ def expected_misses(*status_codes: int):
         _expected_miss_statuses.reset(token)
 
 
-def submit_with_context(executor, func, /, *args, **kwargs):
+def submit_with_context(executor, func, /, *args, **kwargs) -> Future:
     """Submit a worker with the caller's failure-capture context."""
     context = copy_context()
     return executor.submit(context.run, func, *args, **kwargs)
@@ -556,6 +578,19 @@ def request(
         if filtered:
             separator = "&" if ("?" in url) else "?"
             url = f"{url}{separator}{urlencode(filtered)}"
+    # Encode any non-ASCII characters to prevent UnicodeEncodeError from
+    # http.client.HTTPConnection.putrequest (which uses latin-1 internally).
+    # Only encode path, query, and fragment — not the hostname (netloc), which
+    # needs IDNA encoding instead of percent-encoding for non-ASCII domains.
+    parts = urlsplit(url)
+    safe = '/:@!$&\'()*+,;=-._~%?#[]=+'
+    url = urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        quote(parts.path, safe=safe),
+        quote(parts.query, safe=safe),
+        quote(parts.fragment, safe=safe),
+    ))
 
     fixture_request = _fixture_request(method, url, json_data, raw)
     fixture_redactions = _fixture_redactions(url, headers, json_data)

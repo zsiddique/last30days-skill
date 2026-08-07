@@ -848,6 +848,404 @@ def test_get_new_findings_filters_by_date(temp_db, sample_report):
 
     assert len(new_findings) == 4
 
+# === Tests for the discovery topic queue (migration 3, U6) ===
+
+
+def test_init_db_reaches_migration_3_with_discovery_topics_table(temp_db):
+    """A fresh database lands on migration 3 with the queue table present."""
+    conn = sqlite3.connect(str(temp_db))
+    version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+    table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='discovery_topics'"
+    ).fetchone()
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(discovery_topics)").fetchall()
+    }
+    conn.close()
+
+    assert version == 3
+    assert table is not None
+    assert {
+        "id", "name", "normalized_name", "entity_key", "domain",
+        "first_surfaced", "last_surfaced", "surface_count", "status",
+        "covered_at", "last_run_ref",
+    } <= columns
+
+
+def test_migration_2_db_upgrades_to_3_without_data_loss(tmp_path, monkeypatch):
+    """A database built at migration 2 gains the queue table without losing rows."""
+    db_path = tmp_path / "research.db"
+    monkeypatch.setattr(store, "_db_override", db_path)
+    full_migrations = store.MIGRATIONS
+
+    monkeypatch.setattr(store, "MIGRATIONS", {2: full_migrations[2]})
+    store.init_db()
+    topic = store.add_topic("Preexisting Topic")
+    run_id = store.record_run(topic["id"], source_mode="v3")
+    store.store_findings(run_id, topic["id"], [{
+        "source": "reddit",
+        "source_url": "https://reddit.com/preexisting",
+        "source_title": "Preexisting",
+        "content": "Content",
+    }])
+
+    conn = sqlite3.connect(str(db_path))
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='discovery_topics'"
+    ).fetchone() is None
+    conn.close()
+
+    monkeypatch.setattr(store, "MIGRATIONS", full_migrations)
+    store.init_db()
+
+    conn = sqlite3.connect(str(db_path))
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 3
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='discovery_topics'"
+    ).fetchone() is not None
+    assert conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0] == 1
+    conn.close()
+
+
+def test_record_discovery_surfacing_inserts_fresh_row(temp_db):
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates",
+        domain="AI agents",
+        run_ref="discover:AI agents:2026-07-20T00:00:00+00:00",
+        as_of="2026-07-20",
+    )
+
+    assert row["name"] == "Gemma 4 chat templates"
+    assert row["normalized_name"] == "gemma 4 chat templates"
+    assert row["domain"] == "AI agents"
+    assert row["surface_count"] == 1
+    assert row["first_surfaced"] == "2026-07-20"
+    assert row["last_surfaced"] == "2026-07-20"
+    assert row["status"] == "surfaced"
+    assert row["covered_at"] is None
+    assert row["entity_key"]  # computed at write time from entity tokens
+
+
+def test_record_discovery_surfacing_resurfacing_increments_count(temp_db):
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    # Same normalized identity: casefold, punctuation-stripped, whitespace-collapsed.
+    row = store.record_discovery_surfacing(
+        "  GEMMA 4  chat, templates! ", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+    )
+
+    assert row["surface_count"] == 2
+    assert row["first_surfaced"] == "2026-07-13"
+    assert row["last_surfaced"] == "2026-07-20"
+    assert row["last_run_ref"] == "run-2"
+
+    conn = sqlite3.connect(str(temp_db))
+    assert conn.execute("SELECT COUNT(*) FROM discovery_topics").fetchone()[0] == 1
+    conn.close()
+
+
+def test_record_discovery_surfacing_blank_domain_resurfacing_preserves_prior_domain(temp_db):
+    """A bare global-trending resurfacing (domain='') must not blank a domain
+    recorded by an earlier, domain-scoped surfacing of the same topic."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="", run_ref="run-2", as_of="2026-07-20",
+    )
+
+    assert row["domain"] == "AI agents"
+    assert row["surface_count"] == 2
+
+
+def test_record_discovery_surfacing_none_domain_resurfacing_preserves_prior_domain(temp_db):
+    """If the API is called with domain=None (bypassing the str default),
+    that must not bind NULL and blank a previously recorded domain either."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain=None, run_ref="run-2", as_of="2026-07-20",
+    )
+
+    assert row["domain"] == "AI agents"
+    assert row["surface_count"] == 2
+
+
+def test_record_discovery_surfacing_new_nonempty_domain_still_updates(temp_db):
+    """A resurfacing that supplies a NEW non-empty domain should still update
+    the stored domain - only a blank/None incoming domain preserves history."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="LLM tooling", run_ref="run-2", as_of="2026-07-20",
+    )
+
+    assert row["domain"] == "LLM tooling"
+    assert row["surface_count"] == 2
+
+
+def test_match_discovery_topic_exact_normalized_name(temp_db):
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-20",
+    )
+
+    match = store.match_discovery_topic("gemma 4 CHAT templates!")
+
+    assert match is not None
+    assert match["normalized_name"] == "gemma 4 chat templates"
+
+
+def test_match_discovery_topic_cross_matches_near_duplicates_without_merging(temp_db):
+    """Two angles on the same subject cross-match for annotation, but recording
+    both keeps both rows - matching NEVER merges."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    match = store.match_discovery_topic("Gemma 4 tool calling fixes")
+    assert match is not None
+    assert match["normalized_name"] == "gemma 4 chat templates"
+
+    store.record_discovery_surfacing(
+        "Gemma 4 tool calling fixes", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+    )
+
+    conn = sqlite3.connect(str(temp_db))
+    rows = conn.execute(
+        "SELECT normalized_name, surface_count FROM discovery_topics ORDER BY id"
+    ).fetchall()
+    conn.close()
+    assert rows == [
+        ("gemma 4 chat templates", 1),
+        ("gemma 4 tool calling fixes", 1),
+    ]
+
+
+def test_match_discovery_topic_unrelated_names_do_not_match(temp_db):
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-20",
+    )
+
+    assert store.match_discovery_topic("OpenAI Agent SDK pricing") is None
+    assert store.match_discovery_topic("Rust async runtime debates") is None
+
+
+def test_match_discovery_topic_empty_queue_returns_none(temp_db):
+    assert store.match_discovery_topic("Anything at all") is None
+
+
+def test_record_discovery_surfacing_inherit_covered_creates_row_born_covered(temp_db):
+    """A fresh row recorded with inherit_covered_at is born covered - the
+    caller passes it when the name fuzzy-matched an already-covered prior,
+    so a user's covered mark survives judge naming drift (review #7)."""
+    row = store.record_discovery_surfacing(
+        "Gemma 4 template fixes", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+        inherit_covered_at="2026-07-14",
+    )
+
+    assert row["status"] == "covered"
+    assert row["covered_at"] == "2026-07-14"
+    assert row["surface_count"] == 1
+
+
+def test_record_discovery_surfacing_inherit_never_alters_existing_row_status(temp_db):
+    """The ON CONFLICT path ignores inherit_covered_at: an existing surfaced
+    row stays surfaced, and an existing covered row stays covered with its
+    original covered_at."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+        inherit_covered_at="2026-07-14",
+    )
+    assert row["status"] == "surfaced"
+    assert row["covered_at"] is None
+
+    store.mark_discovery_covered("Gemma 4 chat templates", as_of="2026-07-21")
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-3", as_of="2026-07-22",
+        inherit_covered_at=None,
+    )
+    assert row["status"] == "covered"
+    assert row["covered_at"] == "2026-07-21"
+
+
+def test_covered_status_survives_judge_rename_across_runs(temp_db):
+    """Flip-flop regression (review #7): cover name A; a fuzzy-matching
+    rename B is recorded born-covered; resurfacing B exact-matches its own
+    covered row, so the covered mark never silently evaporates."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    store.mark_discovery_covered("Gemma 4 chat templates", as_of="2026-07-14")
+
+    prior = store.match_discovery_topic("Gemma 4 template fixes")
+    assert prior is not None and prior["status"] == "covered"
+    store.record_discovery_surfacing(
+        "Gemma 4 template fixes", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+        inherit_covered_at=prior["covered_at"],
+    )
+
+    exact = store.match_discovery_topic("Gemma 4 template fixes")
+    assert exact is not None
+    assert exact["status"] == "covered"
+    assert exact["covered_at"] == "2026-07-14"
+
+
+def test_record_discovery_surfacing_same_run_ref_is_idempotent(temp_db):
+    """AE6: a retry within the same run identity (e.g. --finalize re-run with
+    a corrected angles file) never double-counts - the guarded call returns
+    the row unchanged."""
+    first = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    retry = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-20",
+    )
+
+    assert retry["surface_count"] == 1
+    assert retry["last_surfaced"] == "2026-07-13"
+    assert retry == first
+
+
+def test_record_discovery_surfacing_guard_is_per_run_not_global(temp_db):
+    """A later run with a DIFFERENT run_ref still increments: the idempotency
+    guard binds to one run identity, never to the row."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+    )
+
+    assert row["surface_count"] == 2
+    assert row["last_surfaced"] == "2026-07-20"
+    assert row["last_run_ref"] == "run-2"
+
+
+def test_record_discovery_surfacing_same_run_ref_never_touches_covered(temp_db):
+    """The guard obeys the existing never-mutate rule: a retry against a
+    covered row leaves status/covered_at exactly as the user set them."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    store.mark_discovery_covered("Gemma 4 chat templates", as_of="2026-07-14")
+
+    retry = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-20",
+        inherit_covered_at="2026-07-19",
+    )
+
+    assert retry["surface_count"] == 1
+    assert retry["status"] == "covered"
+    assert retry["covered_at"] == "2026-07-14"
+
+
+def test_record_discovery_surfacing_blank_run_ref_keeps_legacy_increment(temp_db):
+    """Callers that pass no run_ref (blank) keep the pre-guard behavior:
+    every surfacing increments. The guard only binds real run identities."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", as_of="2026-07-13",
+    )
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", as_of="2026-07-20",
+    )
+
+    assert row["surface_count"] == 2
+
+
+def test_mark_discovery_covered_by_exact_name(temp_db):
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    row = store.mark_discovery_covered("Gemma 4 chat templates", as_of="2026-07-20")
+
+    assert row is not None
+    assert row["status"] == "covered"
+    assert row["covered_at"] == "2026-07-20"
+
+
+def test_mark_discovery_covered_unknown_name_returns_none(temp_db):
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    # Exact normalized match required: a near-duplicate must NOT cover the row.
+    assert store.mark_discovery_covered("Gemma 4 tool calling fixes", as_of="2026-07-20") is None
+    assert store.mark_discovery_covered("No Such Topic", as_of="2026-07-20") is None
+
+
+def test_list_discovery_queue_orders_by_last_surfaced_and_filters_status(temp_db):
+    store.record_discovery_surfacing("Older topic", domain="d", run_ref="r1", as_of="2026-07-01")
+    store.record_discovery_surfacing("Newer topic", domain="d", run_ref="r2", as_of="2026-07-19")
+    store.record_discovery_surfacing("Covered topic", domain="d", run_ref="r3", as_of="2026-07-10")
+    store.mark_discovery_covered("Covered topic", as_of="2026-07-20")
+
+    all_rows = store.list_discovery_queue()
+    assert [r["name"] for r in all_rows] == ["Newer topic", "Covered topic", "Older topic"]
+
+    surfaced = store.list_discovery_queue(status="surfaced")
+    assert [r["name"] for r in surfaced] == ["Newer topic", "Older topic"]
+
+    covered = store.list_discovery_queue(status="covered")
+    assert [r["name"] for r in covered] == ["Covered topic"]
+
+
+def test_store_findings_none_engagement_on_update_does_not_crash(temp_db):
+    """Regression: store_findings must not TypeError when an update-path finding
+    carries engagement_score=None.
+
+    .get("engagement_score", 0) only substitutes 0 for an *absent* key, so a
+    present-but-None value reached max(None, existing) on the update branch.
+    store_findings accepts arbitrary List[Dict[str, Any]] callers, so the
+    boundary must stay null-safe (engagement_score is float | None in schema.py).
+    """
+    topic_id = store.add_topic("None Engagement Topic")["id"]
+    url = "https://example.com/none-engagement"
+    base = {
+        "source": "reddit",
+        "source_url": url,
+        "source_title": "T",
+        "author": "",
+        "content": "",
+        "summary": "",
+        "relevance_score": 0.5,
+    }
+
+    # First sighting carries a real engagement score.
+    run1 = store.record_run(topic_id, source_mode="test", status="running")
+    store.store_findings(run1, topic_id, [{**base, "engagement_score": 5.0}])
+
+    # Re-sighting the same URL with engagement_score=None takes the UPDATE branch;
+    # before the fix this raised TypeError from max(None, 5.0).
+    run2 = store.record_run(topic_id, source_mode="test", status="running")
+    counts = store.store_findings(run2, topic_id, [{**base, "engagement_score": None}])
+    assert counts["updated"] == 1
+
+    con = sqlite3.connect(str(temp_db))
+    try:
+        stored = con.execute(
+            "SELECT engagement_score FROM findings WHERE source_url = ?", (url,)
+        ).fetchone()[0]
+    finally:
+        con.close()
+    # max(None -> 0, existing 5.0) keeps the higher real score.
+    assert stored == 5.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

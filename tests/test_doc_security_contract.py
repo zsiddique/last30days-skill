@@ -57,16 +57,13 @@ def test_security_copy_avoids_stale_cookie_and_endpoint_claims():
 
 
 def test_scrapecreators_copy_uses_canonical_free_call_count():
-    # NOTE: the real ScrapeCreators free tier is 100 credits, one-time (see
-    # last30days-skill issue #367), not "10,000 free calls" — ui.py and
-    # setup_wizard.py were corrected to say so. CONFIGURATION.md, README.md,
-    # and SKILL.md still claim "10,000 free calls" in ~11 places, including
-    # SKILL.md onboarding copy that claims the GitHub signup path grants
-    # *more* free calls than the web form — a structural claim, not just a
-    # wrong number, so fixing those needs more than swapping a digit. That
-    # doc pass is out of scope here; this assertion is narrowed to the
-    # sources that were actually corrected until the docs get their own pass.
-    text = UI_PY.read_text(encoding="utf-8")
-    assert "100 free credits" in text
-    assert "10,000 free calls" not in text
-    assert "1,000 free" not in text
+    # The real ScrapeCreators free tier is 100 credits, one-time (see
+    # last30days-skill issue #367), not "10,000 free calls" — and the
+    # signup path (GitHub device-auth vs. the web form) does not change
+    # the grant, so neither should claim more free calls than the other.
+    for source in (CONFIGURATION, README, SKILL_MD, UI_PY):
+        text = source.read_text(encoding="utf-8")
+        assert "100 free credits" in text
+        assert "10,000 free calls" not in text
+        assert "1,000 free" not in text
+        assert "more than the web" not in text

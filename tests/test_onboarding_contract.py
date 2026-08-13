@@ -4,7 +4,7 @@ Step 0 has two branches: a **Claude Code Modal Flow** (AskUserQuestion-driven,
 the restored v3.0.0 NUX) and a **Non-Modal Prose Flow** for hosts without modals
 (OpenClaw, Codex, Cursor, Gemini CLI). These tests assert the structural
 guarantees of both branches, plus the cross-cutting copy rules: the hard
-"Step 0 before Step 1" gate, Digg threaded alongside yt-dlp, the 10,000-free-calls
+"Step 0 before Step 1" gate, Digg threaded alongside yt-dlp, the 100-free-credits
 credit count, and Threads/Pinterest kept out of the onboarding offers. They read
 SKILL.md as text - the model's runtime contract - matching
 tests/test_runtime_preflight_contract.py.
@@ -147,10 +147,11 @@ class TestOnboardingContract(unittest.TestCase):
         # The Auto-setup modal option names every installed CLI, not just two.
         self.assertIn("yt-dlp (YouTube), Digg, arXiv, Techmeme", self.modal)
 
-    # --- Credit count = 10,000, no conflicting numbers in onboarding ---
+    # --- Credit count = 100 free credits, no conflicting numbers in onboarding ---
 
-    def test_credit_count_is_10000(self):
-        self.assertIn("10,000 free calls", self.step0)
+    def test_credit_count_is_100(self):
+        self.assertIn("100 free credits", self.step0)
+        self.assertNotIn("10,000 free calls", self.step0)
         self.assertNotIn("1,000 free", self.step0)
         self.assertNotIn("1000 free credit", self.step0)
         self.assertNotIn("1000 credits", self.step0)
@@ -189,7 +190,7 @@ class TestOnboardingContract(unittest.TestCase):
         self.assertIn("comments", before.lower())
         self.assertIn("Reddit", before)
         self.assertIn("YouTube", before)
-        self.assertIn("10,000 free calls", before)
+        self.assertIn("100 free credits", before)
         # Empty-only search backup (not transport/rate-limit escalation).
         self.assertIn("returns no items", before)
         self.assertNotIn("when they hit rate limits", before)

@@ -677,8 +677,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--x-handle", help="X handle for targeted supplemental search")
     parser.add_argument("--x-related", help="Comma-separated related X handles (searched with lower weight)")
     parser.add_argument("--web-backend", default="auto",
-                        choices=["auto", "brave", "exa", "serper", "parallel", "keyless", "none"],
+                        choices=["auto", "brave", "exa", "serper", "parallel", "searxng", "keyless", "none"],
                         help="Web search backend (default: auto, tries Brave then Exa then Serper then Parallel; "
+                             "searxng queries a self-hosted SearXNG instance (LAST30DAYS_SEARXNG_URL); "
                              "keyless forces the zero-key DuckDuckGo/SearXNG floor)")
     parser.add_argument("--deep-research", action="store_true",
                         help="Use Perplexity Deep Research (~$0.90/query) for in-depth analysis. Requires PERPLEXITY_API_KEY or OPENROUTER_API_KEY.")

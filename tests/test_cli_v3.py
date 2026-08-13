@@ -194,9 +194,17 @@ class CliV3Tests(unittest.TestCase):
         self.assertEqual("keyless", args.web_backend)
         self.assertEqual([], extra)
 
+    def test_build_parser_accepts_web_backend_searxng(self):
+        """CONFIGURATION.md documents --web-backend=searxng to pin the
+        self-hosted SearXNG backend; the choices list must accept it."""
+        parser = cli.build_parser()
+        args, extra = parser.parse_known_args(["--web-backend", "searxng", "biosecurity"])
+        self.assertEqual("searxng", args.web_backend)
+        self.assertEqual([], extra)
+
     def test_build_parser_still_accepts_other_web_backend_values(self):
         parser = cli.build_parser()
-        for value in ("auto", "brave", "exa", "serper", "parallel", "none"):
+        for value in ("auto", "brave", "exa", "serper", "parallel", "searxng", "none"):
             args, extra = parser.parse_known_args(["--web-backend", value, "biosecurity"])
             self.assertEqual(value, args.web_backend)
             self.assertEqual([], extra)

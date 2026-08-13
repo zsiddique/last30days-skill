@@ -58,10 +58,10 @@ TIER_WARN = "warn"
 TIER_ERROR = "error"
 
 # Web search backend order. grounding.web_search's auto branch owns the
-# runtime behavior (brave -> exa -> serper -> parallel -> keyless floor);
-# there is no importable constant there, so this declaration is guarded by
-# the grounding-auto parity test rather than an import.
-WEB_BACKEND_ORDER: Tuple[str, ...] = ("brave", "exa", "serper", "parallel", "keyless")
+# runtime behavior (brave -> exa -> serper -> parallel -> searxng -> keyless
+# floor); there is no importable constant there, so this declaration is
+# guarded by the grounding-auto parity test rather than an import.
+WEB_BACKEND_ORDER: Tuple[str, ...] = ("brave", "exa", "serper", "parallel", "searxng", "keyless")
 
 # YouTube backend order (pipeline: yt-dlp first, ScrapeCreators search
 # fallback when yt-dlp is absent or fails — see lib/pipeline.py).
@@ -312,6 +312,40 @@ def _probe_ytdlp(config: Dict[str, Any]) -> BackendFinding:
     )
 
 
+def _probe_web_searxng(config: Dict[str, Any]) -> BackendFinding:
+    """Self-hosted SearXNG metasearch, configured via LAST30DAYS_SEARXNG_URL.
+
+    Not a paid key, but a configured instance is a first-class result the
+    way brave/exa/serper/parallel are, not a degraded floor: it outranks
+    the keyless DDG floor exactly as grounding.web_search's auto branch
+    does. Still suppressed on native-search hosts, the same gate the
+    keyless floor uses (env.keyless_web_allowed).
+    """
+    requires = "LAST30DAYS_SEARXNG_URL; suppressed on native-search hosts"
+    if not config.get("LAST30DAYS_SEARXNG_URL"):
+        return BackendFinding(
+            name="searxng",
+            status=health.MISSING,
+            detail="LAST30DAYS_SEARXNG_URL not set",
+            prescription="set LAST30DAYS_SEARXNG_URL to a SearXNG instance base URL",
+            requires=requires,
+        )
+    if not env.keyless_web_allowed(config):
+        return BackendFinding(
+            name="searxng",
+            status=health.MISSING,
+            detail="searxng suppressed: host has native web search",
+            prescription="",
+            requires=requires,
+        )
+    return BackendFinding(
+        name="searxng",
+        status=health.OK,
+        detail="LAST30DAYS_SEARXNG_URL configured",
+        requires=requires,
+    )
+
+
 def _probe_web_keyless(config: Dict[str, Any]) -> BackendFinding:
     """The keyless web-search floor: works keyless, but degraded quality."""
     requires = "no key; suppressed on native-search hosts"
@@ -358,9 +392,14 @@ _WEB_PROBES: Dict[str, Callable[[Dict[str, Any]], BackendFinding]] = {
     "exa": _key_probe("exa", "EXA_API_KEY", "EXA_API_KEY"),
     "serper": _key_probe("serper", "SERPER_API_KEY", "SERPER_API_KEY"),
     "parallel": _key_probe("parallel", "PARALLEL_API_KEY", "PARALLEL_API_KEY"),
+    "searxng": _probe_web_searxng,
     "keyless": _probe_web_keyless,
 }
 _WEB_KEYED = {"brave", "exa", "serper", "parallel"}
+_WEB_REQUIRES = {
+    "searxng": "LAST30DAYS_SEARXNG_URL; suppressed on native-search hosts",
+    "keyless": "no key; suppressed on native-search hosts",
+}
 
 _SC_SPEC = BackendSpec(
     name="scrapecreators",
@@ -413,7 +452,7 @@ DESCRIPTORS: Dict[str, ChainDescriptor] = {
             BackendSpec(
                 name=name,
                 requires=(f"{name.upper()}_API_KEY" if name in _WEB_KEYED
-                          else "no key; suppressed on native-search hosts"),
+                          else _WEB_REQUIRES[name]),
                 probe=_WEB_PROBES[name],
                 paid=name in _WEB_KEYED,
             )

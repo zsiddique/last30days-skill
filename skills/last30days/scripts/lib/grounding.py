@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import urlparse
 
-from . import dates, env, http, schema, web_crawl4ai, web_search_keyless
+from . import dates, env, http, schema, web_crawl4ai, web_search_keyless, web_searxng
 
 
 @dataclass(frozen=True)
@@ -239,6 +239,12 @@ def web_search(
             backend = "serper"
         elif config.get("PARALLEL_API_KEY"):
             backend = "parallel"
+        elif config.get("LAST30DAYS_SEARXNG_URL") and env.keyless_web_allowed(config):
+            # Self-hosted metasearch beats scraping DDG HTML through crawl4ai: a
+            # configured SearXNG instance aggregates multiple real engines
+            # (including a keyed Brave engine when the instance has one), so it
+            # outranks crawl4ai while still yielding to a configured paid key.
+            backend = "searxng"
         elif config.get("CRAWL4AI_URL") and env.keyless_web_allowed(config):
             # On-infra preference: a configured crawl4ai service beats the
             # keyless floor (renders JS, hides datacenter egress) while still
@@ -273,6 +279,8 @@ def web_search(
         if not key:
             raise RuntimeError("PARALLEL_API_KEY is required when web_backend='parallel'")
         items, artifact = parallel_search(query, date_range, key)
+    elif backend == "searxng":
+        items, artifact = web_searxng.searxng_search(query, date_range, config)
     elif backend == "crawl4ai":
         items, artifact = web_crawl4ai.crawl4ai_search(query, date_range, config)
     elif backend == "keyless":

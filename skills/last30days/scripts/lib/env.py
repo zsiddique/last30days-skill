@@ -507,6 +507,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('XAI_BASE_URL', None),
         ('OPENROUTER_BASE_URL', None),
         ('SCRAPECREATORS_API_KEY', None),
+        ('LAST30DAYS_SC_CACHE_MAX_AGE', '1d'),
         ('APIFY_API_TOKEN', None),
         ('AUTH_TOKEN', None),
         ('CT0', None),
@@ -1102,6 +1103,39 @@ def is_instagram_available(config: dict[str, Any]) -> bool:
 def get_instagram_token(config: dict[str, Any]) -> str:
     """Get Instagram API token (same ScrapeCreators key as TikTok)."""
     return config.get('SCRAPECREATORS_API_KEY') or ''
+
+
+# ScrapeCreators' `cache_max_age` query param only accepts these five
+# buckets; an unsupported value 400s the request, so it must be validated
+# client-side (see get_scrapecreators_cache_max_age) rather than forwarded raw.
+SCRAPECREATORS_CACHE_MAX_AGE_VALUES = frozenset({"1d", "3d", "7d", "14d", "30d"})
+_SCRAPECREATORS_CACHE_MAX_AGE_DISABLE_VALUES = frozenset({"off", "none", "0", ""})
+
+
+def get_scrapecreators_cache_max_age(config: dict[str, Any]) -> str | None:
+    """Resolve LAST30DAYS_SC_CACHE_MAX_AGE to the value to send, or None to disable.
+
+    Defaults to "1d": the tool's lookback window is 30 days, so at most
+    one-day-stale engagement counts are negligible, while iterating on the
+    same topic within a session becomes free (a ScrapeCreators cache hit
+    costs 0 credits). "off"/"none"/"0"/empty disable caching outright (no
+    param sent, byte-identical requests to today). Any other value is
+    validated against ScrapeCreators' five accepted buckets; an invalid value
+    is rejected client-side with a stderr warning and caching is disabled for
+    the run rather than raising (sending it would 400 every request).
+    """
+    raw = config.get('LAST30DAYS_SC_CACHE_MAX_AGE')
+    raw = '1d' if raw is None else str(raw).strip().lower()
+    if raw in _SCRAPECREATORS_CACHE_MAX_AGE_DISABLE_VALUES:
+        return None
+    if raw in SCRAPECREATORS_CACHE_MAX_AGE_VALUES:
+        return raw
+    sys.stderr.write(
+        f"[last30days] WARNING: invalid LAST30DAYS_SC_CACHE_MAX_AGE={raw!r} "
+        f"(expected one of {sorted(SCRAPECREATORS_CACHE_MAX_AGE_VALUES)}, or "
+        "off/none/0 to disable); disabling ScrapeCreators caching for this run.\n"
+    )
+    return None
 
 
 def get_xiaohongshu_api_base(config: dict[str, Any]) -> str:

@@ -2798,6 +2798,12 @@ def _main(
     if _config_truthy(config.get("LAST30DAYS_CORPUS_IN_EXPORT")):
         config["_CORPUS_IN_EXPORT"] = True
     _propagate_config_to_environ(config)
+    # Wire the resolved (validated) cache_max_age into http.py once, at
+    # startup, so every ScrapeCreators call in the run gets it for free —
+    # pipeline.run/run_discover/run_discover_nominate/run_discover_resume
+    # have no shared init of their own, so this CLI-level config load is the
+    # single choke point for a real invocation.
+    http.set_scrapecreators_cache_max_age(env.get_scrapecreators_cache_max_age(config))
 
     # Env-var fallback for --save-dir, mirroring the LAST30DAYS_STORE pattern below.
     # Uses `is None` / `is not None` checks (not truthy `or`) at every layer so that

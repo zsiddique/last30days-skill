@@ -21,6 +21,73 @@ from . import log as _log
 
 DEFAULT_TIMEOUT = 30
 
+SCRAPECREATORS_HOST = "api.scrapecreators.com"
+
+# `cache_max_age` query param injected into every request to
+# SCRAPECREATORS_HOST once set (see `set_scrapecreators_cache_max_age`).
+# None means disabled: requests are byte-identical to today.
+_scrapecreators_cache_max_age: Optional[str] = None
+
+
+def set_scrapecreators_cache_max_age(value: Optional[str]) -> None:
+    """Configure the ScrapeCreators `cache_max_age` param injected by `request()`.
+
+    ``value`` must already be one of ScrapeCreators' accepted buckets
+    (1d/3d/7d/14d/30d) — callers validate against
+    ``env.get_scrapecreators_cache_max_age`` before calling this; an
+    unsupported value would 400 every ScrapeCreators request. Pass ``None``
+    (or any falsy value) to disable, which omits the param entirely.
+    """
+    global _scrapecreators_cache_max_age
+    _scrapecreators_cache_max_age = value or None
+
+
+def _is_scrapecreators_host(url: str) -> bool:
+    """True if `url` targets the ScrapeCreators API host."""
+    try:
+        return (urlsplit(url).hostname or "").lower() == SCRAPECREATORS_HOST
+    except ValueError:
+        return False
+
+
+def _with_scrapecreators_cache_param(
+    url: str, params: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Merge the configured `cache_max_age` into `params` for ScrapeCreators calls.
+
+    Returns a new dict (or `params` unchanged) — never mutates the caller's
+    dict. A no-op unless caching is enabled and `url` targets
+    SCRAPECREATORS_HOST; endpoints that don't support caching ignore the
+    param silently, so it's safe to send on every ScrapeCreators request. A
+    caller-supplied `cache_max_age` (none exist today) always wins.
+    """
+    if not _scrapecreators_cache_max_age or not _is_scrapecreators_host(url):
+        return params
+    merged = dict(params) if params else {}
+    merged.setdefault("cache_max_age", _scrapecreators_cache_max_age)
+    return merged
+
+
+def _note_scrapecreators_cache_hit(url: str, value: Any) -> None:
+    """Emit a debug line when a ScrapeCreators response reports a cache hit.
+
+    Cache hits cost 0 credits, so this is purely observability (how much the
+    caller is saving) — cheap, one line per cached response, gated on the
+    same LAST30DAYS_DEBUG flag other modules use.
+    """
+    if not _log.is_debug():
+        return
+    if not isinstance(value, dict) or not value.get("cached"):
+        return
+    if not _is_scrapecreators_host(url):
+        return
+    cached_at = value.get("cached_at", "unknown")
+    _log.source_log(
+        "ScrapeCreators",
+        f"cache hit (cached_at={cached_at}); 0 credits charged",
+        tty_only=False,
+    )
+
 
 def log(msg: str):
     """Log debug message to stderr."""
@@ -573,6 +640,7 @@ def request(
     headers = headers or {}
     headers.setdefault("User-Agent", USER_AGENT)
 
+    params = _with_scrapecreators_cache_param(url, params)
     if params:
         filtered = {k: str(v) for k, v in params.items() if v is not None}
         if filtered:
@@ -596,6 +664,7 @@ def request(
     fixture_redactions = _fixture_redactions(url, headers, json_data)
     replayed = _fixture_replay(fixture_request)
     if replayed is not _NO_FIXTURE:
+        _note_scrapecreators_cache_hit(url, replayed)
         return replayed
 
     data = None
@@ -631,6 +700,7 @@ def request(
                     return body
                 parsed = json.loads(body) if body else {}
                 _fixture_record(fixture_request, value=parsed, redactions=fixture_redactions)
+                _note_scrapecreators_cache_hit(url, parsed)
                 return parsed
         except urllib.error.HTTPError as e:
             body = None

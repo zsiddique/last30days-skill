@@ -43,7 +43,7 @@ Auto setup gives you the core sources free in about 30 seconds:
 - Trustpilot - brand/company review sentiment - opt-in (add trustpilot to INCLUDE_SOURCES), off by default.
 - Hacker News + Polymarket + GitHub (auto-on if the gh CLI is installed) - always on, zero config.
 
-Want TikTok and Instagram too? ScrapeCreators adds those (10,000 free calls, scrapecreators.com). No kickbacks, no affiliation.
+Want TikTok and Instagram too? ScrapeCreators adds those (100 free credits, scrapecreators.com). No kickbacks, no affiliation.
 
 Power users can turn on more sources in the Manual Setup guide (LinkedIn, Bluesky, Perplexity, and others) - each needs its own credential, so they are off by default."""
 

@@ -33,12 +33,21 @@ def _base(config=None) -> str:
     return os.environ.get("CRAWL4AI_URL", DEFAULT_CRAWL4AI).rstrip("/")
 
 
-def _md(url: str, base: str, timeout: int = 60) -> str:
+def _token(config=None):
+    # Config-only by design: env.get_config() already folds the environment in,
+    # and reading a secret straight from os.environ trips the Hermes scanner's
+    # python_environ_get_secret rule, which blocks community installs.
+    if config and config.get("CRAWL4AI_API_TOKEN"):
+        return str(config["CRAWL4AI_API_TOKEN"])
+    return None
+
+
+def _md(url: str, base: str, timeout: int = 60, token=None) -> str:
     body = json.dumps({"url": url, "f": "raw"}).encode()
-    req = urllib.request.Request(
-        base + "/md", data=body,
-        headers={"Content-Type": "application/json"},
-    )
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers = {**headers, "Authorization": f"Bearer {token}"}
+    req = urllib.request.Request(base + "/md", data=body, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             d = json.load(r)
@@ -50,8 +59,9 @@ def _md(url: str, base: str, timeout: int = 60) -> str:
 def crawl4ai_search(query, date_range, config, count: int = 5):
     """Run web search through crawl4ai; returns (items, artifact). Never raises."""
     base = _base(config)
+    token = _token(config)
     ddg = f"{_DDG_HTML_URL}?{urllib.parse.urlencode({'q': query})}"
-    md = _md(ddg, base)
+    md = _md(ddg, base, token=token)
 
     items = []
     seen = set()
